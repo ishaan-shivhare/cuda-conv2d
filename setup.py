@@ -11,9 +11,13 @@ setup(
             sources=[
                 'conv2d_bind.cpp',
                 'conv2d_naive.cu',
+                'conv2d_tma.cu'
             ],
             include_dirs = [
                 pybind11.get_include(),  # This adds the correct include path
+            ],
+            extra_link_args = [
+                '-lcuda'
             ]
         ),
     ],
