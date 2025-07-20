@@ -10,7 +10,7 @@ setup(
             name='my_cuda_conv',
             sources=[
                 'conv2d_bind.cpp',
-                'conv2d_naive.cu',
+                # 'conv2d_naive.cu',
                 'conv2d_tma.cu'
             ],
             include_dirs = [
