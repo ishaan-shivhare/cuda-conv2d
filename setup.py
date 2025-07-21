@@ -16,6 +16,12 @@ setup(
             include_dirs = [
                 pybind11.get_include(),  # This adds the correct include path
             ],
+            extra_compile_args = {
+                'nvcc': [
+                    '-gencode=arch=compute_90a,code=sm_90a',
+                    '-lineinfo'
+                ]
+            },
             extra_link_args = [
                 '-lcuda'
             ]

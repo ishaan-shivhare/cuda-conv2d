@@ -4,13 +4,15 @@ import my_cuda_conv  # Your compiled CUDA extension
 
 # Configuration
 IN_C = 4
-H = W = 128
+H = W = 16
 K = 3
 BLOCK_SIZE = 16
 
 # Create multi-channel input and kernel
 input = torch.arange(IN_C * H * W, dtype=torch.float32, device='cuda').reshape(IN_C, H, W)
 kernel = torch.ones(IN_C, K, K, dtype=torch.float32, device='cuda')  # Use ones for easy reference
+
+# print(input)
 
 # Output shape
 out_H = H - K + 1
@@ -42,7 +44,7 @@ max_error = (cuda_valid - ref_valid).abs().max().item()
 print(f"Max absolute error: {max_error:.6f}")
 
 # Optional debugging
-print("CUDA output:\n", output)
+print("CUDA output:\n", cuda_valid)
 print("Reference output:\n", output_ref)
-print("Difference:\n", output - output_ref)
+print("Difference:\n", cuda_valid - output_ref)
 
