@@ -47,15 +47,15 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
     constexpr uint32_t RANK = 3;
     constexpr uint32_t RANK_OUT = 2;
 
-    uint64_t input_dims[RANK] = {static_cast<uint64_t>(IN_C), static_cast<uint64_t>(H), static_cast<uint64_t>(W)};
+    uint64_t input_dims[RANK] = {static_cast<uint64_t>(W), static_cast<uint64_t>(H), static_cast<uint64_t>(IN_C)};
     uint64_t input_strides[RANK - 1] = {
-        static_cast<uint64_t>(H * W * sizeof(float)),
-        static_cast<uint64_t>(W * sizeof(float))
+        static_cast<uint64_t>(W * sizeof(float)),
+        static_cast<uint64_t>(H * W * sizeof(float))
     };
-    uint32_t input_box[RANK] = {4, static_cast<uint32_t>(SH_TILE_W), static_cast<uint32_t>(SH_TILE_W)};
+    uint32_t input_box[RANK] = {static_cast<uint32_t>(TILE_W_PAD), static_cast<uint32_t>(SH_TILE_W), 1};
     uint32_t input_elem_stride[RANK] = {1, 1, 1};
 
-    uint64_t output_dims[RANK_OUT] = {static_cast<uint64_t>(padded_out_h), static_cast<uint64_t>(padded_out_w)};
+    uint64_t output_dims[RANK_OUT] = {static_cast<uint64_t>(padded_out_w), static_cast<uint64_t>(padded_out_h)};
     uint64_t output_strides[RANK_OUT - 1] = {
         static_cast<uint64_t>(padded_out_w* sizeof(float))
     };
@@ -105,6 +105,264 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
     }
 }
 
+__global__ void producer_consumer_pattern(
+    const __grid_constant__ CUtensorMap input_map,
+    const __grid_constant__ CUtensorMap output_map,
+    float* kernel,
+    float* out,
+    int OUT_H,
+    int OUT_W,
+    float* inp
+) {
+    // Shared tiles
+    __shared__ alignas(128) float smem_buf0[SH_TILE_W][TILE_W_PAD];
+    __shared__ alignas(128) float smem_buf1[SH_TILE_W][TILE_W_PAD];
+    __shared__ alignas(128) float smem_out[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float          smem_kernel[IN_C][K][K];
+    __shared__ barrier        bar_filled[2];
+
+    // Thread index helpers
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tid = ty*blockDim.x + tx;
+    int lane_count = blockDim.x*blockDim.y;
+
+    // Init the “filled” barriers once
+    if (tid == 0) {
+        init(&bar_filled[0], lane_count);
+        init(&bar_filled[1], lane_count);
+        cde::fence_proxy_async_shared_cta();
+    }
+    __syncthreads();
+
+    // Load kernel into SMEM
+    int total_threads = lane_count;
+    int total_weights = IN_C * K * K;
+    for (int i = tid; i < total_weights; i += total_threads) {
+        int c  = i / (K*K);
+        int kk = i % (K*K);
+        int ky = kk / K, kx = kk % K;
+        smem_kernel[c][ky][kx] = kernel[c*K*K + ky*K + kx];
+    }
+
+    // Zero out smem_out
+    
+    for (int i = ty*blockDim.x + tx; i < BLOCK_SIZE*BLOCK_SIZE; i += blockDim.x*blockDim.y) {
+        int y = i / BLOCK_SIZE, x = i % BLOCK_SIZE;
+        smem_out[y][x] = 0.0f;
+    }
+    
+    __syncthreads();
+
+    if (tid == 0) {
+        printf("Initialised barriers, loaded kernel, zeroed output tile on block (%d, %d)\n", bx, by);
+    }
+
+
+    if (tid == 0) {
+        int H = 16;
+        int W = 16;
+        float* g = reinterpret_cast<float*>(inp);
+        // print the very first two rows of channel‑0:
+        printf("[GMEM ch0 row0] %f %f %f %f\n",
+                g[0*H*W + 0*W + 0],
+                g[0*H*W + 0*W + 1],
+                g[0*H*W + 0*W + 2],
+                g[0*H*W + 0*W + 3]);
+        printf("[GMEM ch0 row1] %f %f %f %f\n",
+                g[0*H*W + 1*W + 0],
+                g[0*H*W + 1*W + 1],
+                g[0*H*W + 1*W + 2],
+                g[0*H*W + 1*W + 3]);
+    }
+
+
+    // Pre‑load chunk 0 into buf 0
+    int c = 0;
+    barrier::arrival_token t0;
+    if (tid == 0) {
+        printf("In producer preload: block (%d,%d), c=%d\n", bx, by, c);
+        cde::cp_async_bulk_tensor_3d_global_to_shared(
+            &smem_buf0[0][0],
+            &input_map,
+            bx*BLOCK_SIZE,
+            by*BLOCK_SIZE,
+            c,
+            bar_filled[0]
+        );
+        t0 = cuda::device::barrier_arrive_tx(
+            bar_filled[0], 1,
+            SH_TILE_W * TILE_W_PAD * sizeof(float)
+        );
+    }
+    else {
+        t0 = bar_filled[0].arrive();
+    }
+    // __syncthreads();
+    // wait + flush buf0
+    bar_filled[0].wait(std::move(t0));
+    cde::fence_proxy_async_shared_cta();
+    __syncthreads();
+
+    if (tid == 0) {
+        // after bar_filled[0].wait(...)
+        for (int c = 0; c < 4; ++c) {
+            printf("[Preload ch %d] buf0[%d][0][0]=%f   [%d][0][1]=%f   [%d][1][0]=%f\n",
+                c,
+                c, smem_buf0[0][0],
+                c, smem_buf0[0][1],
+                c, smem_buf0[1][0]);
+        }
+    }
+
+    int buf = 0;
+    // Main pipeline loop
+    for (int c = 0; c < IN_C; ++c) {
+        if (tid == 0) {
+            printf("[Loop start c=%d] cur_buf=%d sample smem_buf%d[0][0][0]=%f, [0][1][1]=%f\n",
+                    c, buf,
+                    buf,
+                    ((buf==0)? smem_buf0[0][0] : smem_buf1[0][0]),
+                    ((buf==0)? smem_buf0[1][1] : smem_buf1[1][1])
+            );
+        }
+        // Prefetch next
+        barrier::arrival_token tn;
+        int next_c = c + 1;
+        int next_buf = buf ^ 1;        
+        __syncthreads();
+        // 1) Kick off prefetch of next chunk into next_buf
+        float (*cur_buf)[SH_TILE_W][TILE_W_PAD] = (buf==0)
+            ? smem_buf0
+            : smem_buf1;
+        if (next_c < IN_C && tid == 0) {
+            printf("In producer: block (%d,%d), c=%d\n", bx, by, next_c);
+            cde::cp_async_bulk_tensor_3d_global_to_shared(
+            &((next_buf==0? smem_buf0: smem_buf1))[0][0],
+            &input_map,
+            bx*BLOCK_SIZE,
+            by*BLOCK_SIZE,
+            next_c,
+            bar_filled[next_buf]
+        );
+            tn = cuda::device::barrier_arrive_tx(
+                bar_filled[next_buf], 1,
+                SH_TILE_W * TILE_W_PAD * sizeof(float)
+        );
+        } else {
+            tn = bar_filled[next_buf].arrive();
+        }
+        
+        // 2) Compute on cur_buf
+        if (ty==1 && tx==1)
+            printf("Computing on buffer (%d) for block (%d,%d)\n", buf, bx, by);
+        int global_y = by*BLOCK_SIZE + ty;
+        int global_x = bx*BLOCK_SIZE + tx;
+        if (global_y < OUT_H && global_x < OUT_W) {
+            float accum = 0.0f;
+            for (int ky = 0; ky < K; ++ky) {
+                for (int kx = 0; kx < K; ++kx) {
+                    int sy = ty+ky, sx = tx+kx;
+                    if (sy < SH_TILE_W && sx < SH_TILE_W) {
+                        float val    = cur_buf[sy][sx];
+                        float weight = smem_kernel[c][ky][kx];
+                        smem_out[ty][tx] += val * weight;
+                    }
+                }
+            }
+        }
+
+        // 3) Wait + flush next_buf (so it's ready for next iteration)
+        if (next_c < IN_C) {
+            // __syncthreads();
+            bar_filled[next_buf].wait(std::move(tn));
+            cde::fence_proxy_async_shared_cta();
+            __syncthreads();
+        }
+
+        buf = next_buf;
+    }
+
+    __syncthreads();
+    cde::fence_proxy_async_shared_cta();
+    // Final TMA store of smem_out → global
+    if (tid == 0) {
+        printf("Committing output tile for block (%d, %d)\n", bx, by);
+        cde::cp_async_bulk_tensor_2d_shared_to_global(
+            &output_map,
+            by*BLOCK_SIZE,
+            bx*BLOCK_SIZE,
+            &smem_out[0][0]
+        );
+        cde::cp_async_bulk_commit_group();
+        cde::cp_async_bulk_wait_group_read<0>();
+    }
+}
+
+
+void launch_conv2d_tma(torch::Tensor input, torch::Tensor kernel, torch::Tensor output, int padded_out_h, int padded_out_w) {
+    TORCH_CHECK(input.device().is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(kernel.device().is_cuda(), "kernel must be a CUDA tensor");
+    TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
+
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
+    TORCH_CHECK(kernel.dtype() == torch::kFloat32, "kernel must be float32");
+    TORCH_CHECK(output.dtype() == torch::kFloat32, "output must be float32");
+
+    TORCH_CHECK(input.dim() == 3, "input must be [C, H, W]");
+    TORCH_CHECK(kernel.dim() == 3, "kernel must be [C, K, K]");
+    TORCH_CHECK(output.dim() == 2, "output must be [H_out, W_out]");
+
+    TORCH_CHECK(input.size(0) == IN_C, "IN_C mismatch");
+    TORCH_CHECK(kernel.size(0) == IN_C, "IN_C mismatch");
+    TORCH_CHECK(kernel.size(1) == K && kernel.size(2) == K, "Kernel shape mismatch");
+
+    int H = input.size(1);
+    int W = input.size(2);
+    int OUT_H = H - K + 1;
+    int OUT_W = W - K + 1;
+
+    // TORCH_CHECK(output.size(0) == OUT_H && output.size(1) == OUT_W, "Output shape mismatch");
+    // TORCH_CHECK(output.dim() == 3 &&
+    //         output.size(0) == 1 &&
+    //         output.size(1) == OUT_H &&
+    //         output.size(2) == OUT_W,
+    //         "Output shape must be [1, H_out, W_out]");
+
+    // Setup tensor maps
+    CUtensorMap input_map;
+    CUtensorMap output_map;
+    setup_tensor_maps(
+        input_map, output_map,
+        input.data_ptr<float>(), output.data_ptr<float>(),
+        IN_C, H, W,
+        padded_out_h, padded_out_w,
+        BLOCK_SIZE
+    );
+
+    // Kernel launch
+    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);  // z-dim needed due to TMA rules
+    dim3 blocks(
+        // (OUT_W + BLOCK_SIZE - 1) / BLOCK_SIZE,
+        // (OUT_H + BLOCK_SIZE - 1) / BLOCK_SIZE
+        H / BLOCK_SIZE, W / BLOCK_SIZE
+    );
+
+    producer_consumer_pattern<<<blocks, threads>>>(
+        input_map,
+        output_map,
+        kernel.data_ptr<float>(),
+        output.data_ptr<float>(),
+        OUT_H,
+        OUT_W,
+        input.data_ptr<float>()
+    );
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA kernel or TMA error: " << cudaGetErrorString(err) << std::endl;
+    }
+}
 
 // __device__ void producer(const CUtensorMap& tensor_map, barrier ready[], barrier filled[], float* buf0, float* buf1)
 // {
@@ -270,266 +528,3 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
 //     }
 
 // }
-
-// N.B. you can delete your old producer() and consumer() helpers entirely
-__global__ void producer_consumer_pattern(
-    const __grid_constant__ CUtensorMap input_map,
-    const __grid_constant__ CUtensorMap output_map,
-    float* kernel,
-    float* out,
-    int OUT_H,
-    int OUT_W,
-    float* inp
-) {
-    // Shared tiles
-    __shared__ alignas(128) float smem_buf0[4][SH_TILE_W][SH_TILE_W];
-    __shared__ alignas(128) float smem_buf1[4][SH_TILE_W][SH_TILE_W];
-    __shared__ alignas(128) float smem_out[BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ float          smem_kernel[IN_C][K][K];
-    __shared__ barrier        bar_filled[2];
-
-    // Thread index helpers
-    int tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
-    int bx = blockIdx.x, by = blockIdx.y;
-    int tid = tz*blockDim.y*blockDim.x + ty*blockDim.x + tx;
-    int lane_count = blockDim.x*blockDim.y*blockDim.z;
-
-    // Init the “filled” barriers once
-    if (tid == 0) {
-        init(&bar_filled[0], lane_count);
-        init(&bar_filled[1], lane_count);
-        cde::fence_proxy_async_shared_cta();
-    }
-    __syncthreads();
-
-    // Load kernel into SMEM
-    int total_threads = lane_count;
-    int total_weights = IN_C * K * K;
-    for (int i = tid; i < total_weights; i += total_threads) {
-        int c  = i / (K*K);
-        int kk = i % (K*K);
-        int ky = kk / K, kx = kk % K;
-        smem_kernel[c][ky][kx] = kernel[c*K*K + ky*K + kx];
-    }
-
-    // Zero out smem_out
-    if (tz == 0) {
-        for (int i = ty*blockDim.x + tx; i < BLOCK_SIZE*BLOCK_SIZE; i += blockDim.x*blockDim.y) {
-            int y = i / BLOCK_SIZE, x = i % BLOCK_SIZE;
-            smem_out[y][x] = 0.0f;
-        }
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        printf("Initialised barriers, loaded kernel, zeroed output tile on block (%d, %d)\n", bx, by);
-    }
-
-
-    if (tid == 0) {
-        int H = 16;
-        int W = 16;
-        float* g = reinterpret_cast<float*>(inp);
-        // print the very first two rows of channel‑0:
-        printf("[GMEM ch0 row0] %f %f %f %f\n",
-                g[0*H*W + 0*W + 0],
-                g[0*H*W + 0*W + 1],
-                g[0*H*W + 0*W + 2],
-                g[0*H*W + 0*W + 3]);
-        printf("[GMEM ch0 row1] %f %f %f %f\n",
-                g[0*H*W + 1*W + 0],
-                g[0*H*W + 1*W + 1],
-                g[0*H*W + 1*W + 2],
-                g[0*H*W + 1*W + 3]);
-    }
-
-
-    // Pre‑load chunk 0 into buf 0
-    int buf      = 0;
-    int c        = 0;
-    barrier::arrival_token tok[2];
-    if (tid == 0) {
-        printf("In producer preload: block (%d,%d), c=%d\n", bx, by, c);
-        cde::cp_async_bulk_tensor_3d_global_to_shared(
-            &smem_buf0[0][0][0],
-            &input_map,
-            c,
-            by*BLOCK_SIZE,
-            bx*BLOCK_SIZE,
-            bar_filled[0]
-        );
-        tok[0] = cuda::device::barrier_arrive_tx(
-            bar_filled[0], 1,
-            4ULL * SH_TILE_W * SH_TILE_W * sizeof(float)
-        );
-    }
-    else {
-        tok[0] = bar_filled[0].arrive();
-    }
-    // __syncthreads();
-    // wait + flush buf0
-    bar_filled[0].wait(std::move(tok[0]));
-    cde::fence_proxy_async_shared_cta();
-    __syncthreads();
-
-    if (tid == 0) {
-        // after bar_filled[0].wait(...)
-        for (int c = 0; c < 4; ++c) {
-            printf("[Preload ch %d] buf0[%d][0][0]=%f   [%d][0][1]=%f   [%d][1][0]=%f\n",
-                c,
-                c, smem_buf0[c][0][0],
-                c, smem_buf0[c][0][1],
-                c, smem_buf0[c][1][0]);
-        }
-    }
-
-    // Main pipeline loop
-    for (int c = 0; c < IN_C; c += 4) {
-        int next_c   = c + 4;
-        int next_buf = buf ^ 1;
-        float (*cur_buf)[SH_TILE_W][SH_TILE_W] = (buf==0)
-            ? smem_buf0
-            : smem_buf1;
-
-        
-        if (tid == 0) {
-            printf("[Loop start c=%d] cur_buf=%d sample smem_buf%d[0][0][0]=%f, [0][1][1]=%f\n",
-                    c, buf,
-                    buf,
-                    ((buf==0)? smem_buf0[0][0][0] : smem_buf1[0][0][0]),
-                    ((buf==0)? smem_buf0[0][1][1] : smem_buf1[0][1][1])
-            );
-        }
-        __syncthreads();
-        // 1) Kick off prefetch of next chunk into next_buf
-        if (next_c < IN_C && tid == 0) {
-            printf("In producer: block (%d,%d), c=%d\n", bx, by, next_c);
-            cde::cp_async_bulk_tensor_3d_global_to_shared(
-                &((next_buf==0? smem_buf0: smem_buf1)[0][0][0]),
-                &input_map,
-                next_c,
-                by*BLOCK_SIZE,
-                bx*BLOCK_SIZE,
-                bar_filled[next_buf]
-            );
-            tok[next_buf] = cuda::device::barrier_arrive_tx(
-                bar_filled[next_buf], 1,
-                4ULL*SH_TILE_W*SH_TILE_W*sizeof(float)
-            );
-        } else {
-            tok[next_buf] = bar_filled[next_buf].arrive();
-        }
-        
-
-        // 2) Compute on cur_buf
-        if (tz==1 && ty==1 && tx==1)
-            printf("Computing on buffer (%d) for block (%d,%d)\n", buf, bx, by);
-        int global_y = by*BLOCK_SIZE + ty;
-        int global_x = bx*BLOCK_SIZE + tx;
-        if (tz < 4 && global_y < OUT_H && global_x < OUT_W && (c+tz) < IN_C) {
-            float accum = 0.0f;
-            for (int ky = 0; ky < K; ++ky) {
-                for (int kx = 0; kx < K; ++kx) {
-                    int sy = ty+ky, sx = tx+kx;
-                    if (sy < SH_TILE_W && sx < SH_TILE_W) {
-                        float val    = cur_buf[tz][sy][sx];
-                        float weight = smem_kernel[c+tz][ky][kx];
-                        accum += val * weight;
-                    }
-                }
-            }
-            atomicAdd(&smem_out[ty][tx], accum);
-        }
-        
-
-        // 3) Wait + flush next_buf (so it's ready for next iteration)
-        if (next_c < IN_C) {
-            // __syncthreads();
-            bar_filled[next_buf].wait(std::move(tok[next_buf]));
-            cde::fence_proxy_async_shared_cta();
-            __syncthreads();
-        }
-
-        buf = next_buf;
-    }
-
-    __syncthreads();
-    cde::fence_proxy_async_shared_cta();
-    // Final TMA store of smem_out → global
-    if (tid == 0) {
-        printf("Committing output tile for block (%d, %d)\n", bx, by);
-        cde::cp_async_bulk_tensor_2d_shared_to_global(
-            &output_map,
-            by*BLOCK_SIZE,
-            bx*BLOCK_SIZE,
-            &smem_out[0][0]
-        );
-        cde::cp_async_bulk_commit_group();
-        cde::cp_async_bulk_wait_group_read<0>();
-    }
-}
-
-
-void launch_conv2d_tma(torch::Tensor input, torch::Tensor kernel, torch::Tensor output, int padded_out_h, int padded_out_w) {
-    TORCH_CHECK(input.device().is_cuda(), "input must be a CUDA tensor");
-    TORCH_CHECK(kernel.device().is_cuda(), "kernel must be a CUDA tensor");
-    TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
-
-    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
-    TORCH_CHECK(kernel.dtype() == torch::kFloat32, "kernel must be float32");
-    TORCH_CHECK(output.dtype() == torch::kFloat32, "output must be float32");
-
-    TORCH_CHECK(input.dim() == 3, "input must be [C, H, W]");
-    TORCH_CHECK(kernel.dim() == 3, "kernel must be [C, K, K]");
-    TORCH_CHECK(output.dim() == 2, "output must be [H_out, W_out]");
-
-    TORCH_CHECK(input.size(0) == IN_C, "IN_C mismatch");
-    TORCH_CHECK(kernel.size(0) == IN_C, "IN_C mismatch");
-    TORCH_CHECK(kernel.size(1) == K && kernel.size(2) == K, "Kernel shape mismatch");
-
-    int H = input.size(1);
-    int W = input.size(2);
-    int OUT_H = H - K + 1;
-    int OUT_W = W - K + 1;
-
-    // TORCH_CHECK(output.size(0) == OUT_H && output.size(1) == OUT_W, "Output shape mismatch");
-    // TORCH_CHECK(output.dim() == 3 &&
-    //         output.size(0) == 1 &&
-    //         output.size(1) == OUT_H &&
-    //         output.size(2) == OUT_W,
-    //         "Output shape must be [1, H_out, W_out]");
-
-    // Setup tensor maps
-    CUtensorMap input_map;
-    CUtensorMap output_map;
-    setup_tensor_maps(
-        input_map, output_map,
-        input.data_ptr<float>(), output.data_ptr<float>(),
-        IN_C, H, W,
-        padded_out_h, padded_out_w,
-        BLOCK_SIZE
-    );
-
-    // Kernel launch
-    dim3 threads(BLOCK_SIZE, BLOCK_SIZE, 4);  // z-dim needed due to TMA rules
-    dim3 blocks(
-        // (OUT_W + BLOCK_SIZE - 1) / BLOCK_SIZE,
-        // (OUT_H + BLOCK_SIZE - 1) / BLOCK_SIZE
-        H / BLOCK_SIZE, W / BLOCK_SIZE
-    );
-
-    producer_consumer_pattern<<<blocks, threads>>>(
-        input_map,
-        output_map,
-        kernel.data_ptr<float>(),
-        output.data_ptr<float>(),
-        OUT_H,
-        OUT_W,
-        input.data_ptr<float>()
-    );
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA kernel or TMA error: " << cudaGetErrorString(err) << std::endl;
-    }
-}
