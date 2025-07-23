@@ -154,28 +154,9 @@ __global__ void producer_consumer_pattern(
     
     __syncthreads();
 
-    if (tid == 0) {
-        printf("Initialised barriers, loaded kernel, zeroed output tile on block (%d, %d)\n", bx, by);
-    }
-
-
-    if (tid == 0) {
-        int H = 16;
-        int W = 16;
-        float* g = reinterpret_cast<float*>(inp);
-        // print the very first two rows of channel‑0:
-        printf("[GMEM ch0 row0] %f %f %f %f\n",
-                g[0*H*W + 0*W + 0],
-                g[0*H*W + 0*W + 1],
-                g[0*H*W + 0*W + 2],
-                g[0*H*W + 0*W + 3]);
-        printf("[GMEM ch0 row1] %f %f %f %f\n",
-                g[0*H*W + 1*W + 0],
-                g[0*H*W + 1*W + 1],
-                g[0*H*W + 1*W + 2],
-                g[0*H*W + 1*W + 3]);
-    }
-
+    // if (tid == 0) {
+    //     printf("Initialised barriers, loaded kernel, zeroed output tile on block (%d, %d)\n", bx, by);
+    // }
 
     // Pre‑load chunk 0 into buf 0
     int c = 0;
@@ -204,72 +185,60 @@ __global__ void producer_consumer_pattern(
     cde::fence_proxy_async_shared_cta();
     __syncthreads();
 
-    if (tid == 0) {
-        // after bar_filled[0].wait(...)
-        for (int c = 0; c < 4; ++c) {
-            printf("[Preload ch %d] buf0[%d][0][0]=%f   [%d][0][1]=%f   [%d][1][0]=%f\n",
-                c,
-                c, smem_buf0[0][0],
-                c, smem_buf0[0][1],
-                c, smem_buf0[1][0]);
-        }
-    }
 
     int buf = 0;
     // Main pipeline loop
     for (int c = 0; c < IN_C; ++c) {
-        if (tid == 0) {
-            printf("[Loop start c=%d] cur_buf=%d sample smem_buf%d[0][0][0]=%f, [0][1][1]=%f\n",
-                    c, buf,
-                    buf,
-                    ((buf==0)? smem_buf0[0][0] : smem_buf1[0][0]),
-                    ((buf==0)? smem_buf0[1][1] : smem_buf1[1][1])
-            );
-        }
+        
         // Prefetch next
-        barrier::arrival_token tn;
+        
         int next_c = c + 1;
-        int next_buf = buf ^ 1;        
-        __syncthreads();
+        int next_buf = buf ^ 1;
+        barrier::arrival_token tn;        
+        // __syncthreads();
         // 1) Kick off prefetch of next chunk into next_buf
-        float (*cur_buf)[SH_TILE_W][TILE_W_PAD] = (buf==0)
-            ? smem_buf0
-            : smem_buf1;
-        if (next_c < IN_C && tid == 0) {
-            printf("In producer: block (%d,%d), c=%d\n", bx, by, next_c);
-            cde::cp_async_bulk_tensor_3d_global_to_shared(
-            &((next_buf==0? smem_buf0: smem_buf1))[0][0],
-            &input_map,
-            bx*BLOCK_SIZE,
-            by*BLOCK_SIZE,
-            next_c,
-            bar_filled[next_buf]
-        );
-            tn = cuda::device::barrier_arrive_tx(
-                bar_filled[next_buf], 1,
-                SH_TILE_W * TILE_W_PAD * sizeof(float)
-        );
-        } else {
-            tn = bar_filled[next_buf].arrive();
+        float (*cur_buf)[TILE_W_PAD] = (buf==0) ? smem_buf0 : smem_buf1;
+        
+        if (next_c < IN_C){
+            if (tid == 0) {
+                // printf("In producer: block (%d,%d), c=%d\n", bx, by, next_c);
+                cde::cp_async_bulk_tensor_3d_global_to_shared(
+                    &((next_buf==0 ? smem_buf0 : smem_buf1))[0][0],
+                    &input_map,
+                    bx*BLOCK_SIZE,
+                    by*BLOCK_SIZE,
+                    next_c,
+                    bar_filled[next_buf]
+                );
+                tn = cuda::device::barrier_arrive_tx(
+                        bar_filled[next_buf], 1,
+                        SH_TILE_W * TILE_W_PAD * sizeof(float)
+                );
+            } else {
+                tn = bar_filled[next_buf].arrive();
+            }
         }
         
         // 2) Compute on cur_buf
-        if (ty==1 && tx==1)
-            printf("Computing on buffer (%d) for block (%d,%d)\n", buf, bx, by);
+        // if (ty==1 && tx==1)
+        //     printf("Computing on buffer (%d) for block (%d,%d)\n", buf, bx, by);
+        
         int global_y = by*BLOCK_SIZE + ty;
         int global_x = bx*BLOCK_SIZE + tx;
         if (global_y < OUT_H && global_x < OUT_W) {
             float accum = 0.0f;
             for (int ky = 0; ky < K; ++ky) {
                 for (int kx = 0; kx < K; ++kx) {
-                    int sy = ty+ky, sx = tx+kx;
+                    int sy = ty + ky; 
+                    int sx = tx + kx;
                     if (sy < SH_TILE_W && sx < SH_TILE_W) {
                         float val    = cur_buf[sy][sx];
                         float weight = smem_kernel[c][ky][kx];
-                        smem_out[ty][tx] += val * weight;
+                        accum += val * weight;
                     }
                 }
             }
+            smem_out[ty][tx] += accum;
         }
 
         // 3) Wait + flush next_buf (so it's ready for next iteration)
@@ -290,8 +259,8 @@ __global__ void producer_consumer_pattern(
         printf("Committing output tile for block (%d, %d)\n", bx, by);
         cde::cp_async_bulk_tensor_2d_shared_to_global(
             &output_map,
-            by*BLOCK_SIZE,
             bx*BLOCK_SIZE,
+            by*BLOCK_SIZE,
             &smem_out[0][0]
         );
         cde::cp_async_bulk_commit_group();

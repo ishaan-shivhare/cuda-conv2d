@@ -3,8 +3,8 @@ import torch.nn.functional as F
 import my_cuda_conv  # Your compiled CUDA extension
 
 # Configuration
-IN_C = 4
-H = W = 16
+IN_C = 3
+H = W = 64
 K = 3
 BLOCK_SIZE = 16
 
