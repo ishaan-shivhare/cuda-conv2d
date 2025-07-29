@@ -2,9 +2,11 @@ import torch
 import torch.nn.functional as F
 import my_cuda_conv  # Your compiled CUDA extension
 
+torch.backends.cudnn.enabled = False    # cuDNN optimizations lead to small error/difference in output
+
 # Configuration
 IN_C = 3
-H = W = 64
+H = W = 1024
 K = 3
 BLOCK_SIZE = 16
 
@@ -12,7 +14,7 @@ BLOCK_SIZE = 16
 input = torch.arange(IN_C * H * W, dtype=torch.float32, device='cuda').reshape(IN_C, H, W)
 kernel = torch.ones(IN_C, K, K, dtype=torch.float32, device='cuda')  # Use ones for easy reference
 
-# print(input)
+# print(input.shape)
 
 # Output shape
 out_H = H - K + 1
@@ -34,6 +36,7 @@ print("input_pt.shape:", input_pt.shape)     # should be (1, 4, 128, 128)
 print("kernel_pt.shape:", kernel_pt.shape)   # should be (1, 4, 3, 3)
 
 output_ref = F.conv2d(input_pt, kernel_pt).squeeze()  # remove batch dim
+
 
 # Compare only the valid region
 cuda_valid = output[:out_H, :out_W]
