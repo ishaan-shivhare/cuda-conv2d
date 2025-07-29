@@ -105,6 +105,7 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
     }
 }
 
+__launch_bounds__(256,8)
 __global__ void producer_consumer_pattern(
     const __grid_constant__ CUtensorMap input_map,
     const __grid_constant__ CUtensorMap output_map,
