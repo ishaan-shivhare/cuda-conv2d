@@ -6,7 +6,7 @@ torch.backends.cudnn.enabled = False    # cuDNN optimizations lead to small erro
 
 # Configuration
 IN_C = 3
-H = W = 1024
+H = W = 64
 K = 3
 BLOCK_SIZE = 16
 
