@@ -123,7 +123,7 @@ __global__ void producer_consumer_pattern(
         float data[SH_TILE_W][TILE_W_PAD];
     };
     
-    constexpr int DEPTH = 2;
+    constexpr int DEPTH = 3;
     __shared__  SmemTile smem_buf[DEPTH];
     __shared__ alignas(128) float smem_out[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ float smem_kernel[IN_C][K][K];
@@ -165,10 +165,10 @@ __global__ void producer_consumer_pattern(
             int buf = c % DEPTH;
             bar_filled[buf].arrive_and_wait();
             float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
-            if (tid == 0) {
-                printf("Computing on channel %d for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
-                printf("Printing out section of current buffer %d for block (%d, %d) for reference: %f, %f, %f, %f \n", buf, blockIdx.x, blockIdx.y, cur_buf[0][0], cur_buf[0][1], cur_buf[1][0], cur_buf[1][1]);
-            }
+            // if (tid == 0) {
+            //     printf("Computing on channel %d for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
+            //     printf("Printing out section of current buffer %d for block (%d, %d) for reference: %f, %f, %f, %f \n", buf, blockIdx.x, blockIdx.y, cur_buf[0][0], cur_buf[0][1], cur_buf[1][0], cur_buf[1][1]);
+            // }
             for (int i = tid; i < BLOCK_SIZE*BLOCK_SIZE; i += warpSize * 4) {
                 int local_y = i / BLOCK_SIZE;
                 int local_x = i % BLOCK_SIZE;
