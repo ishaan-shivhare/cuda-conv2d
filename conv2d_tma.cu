@@ -118,19 +118,20 @@ __global__ void producer_consumer_pattern(
     int padded_out_w
 ) {
 
-    // Shared memory buffer declared below is of size 2 * buffer_len
-    // so that we can alternatively work between two buffers.
-    // TODO: Maybe merge into one big buffer of size some constant instead of separate 
-    // Shared tiles
-    __shared__ alignas(128) float smem_buf0[SH_TILE_W][TILE_W_PAD];
-    __shared__ alignas(128) float smem_buf1[SH_TILE_W][TILE_W_PAD];
+    // Aligned buffers for TMA
+    struct alignas(128) SmemTile {
+        float data[SH_TILE_W][TILE_W_PAD];
+    };
+    
+    constexpr int DEPTH = 2;
+    __shared__  SmemTile smem_buf[DEPTH];
     __shared__ alignas(128) float smem_out[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ float smem_kernel[IN_C][K][K];
-    __shared__ barrier bar_ready[2]; // track if buffers buffer_0 and buffer_1 are ready to be filled,
-    __shared__ barrier bar_filled[2]; // track if buffers buffer_0 and buffer_1 are filled-in respectively
+    __shared__ barrier bar_ready[DEPTH]; // track if buffers are ready to be filled,
+    __shared__ barrier bar_filled[DEPTH]; // track if buffers are filled-in respectively
 
     int tid = threadIdx.y*blockDim.x + threadIdx.x;
-    if (tid < 2) {
+    if (tid < DEPTH) {
         init(bar_ready + tid, blockDim.x * blockDim.y);
         init(bar_filled + tid, blockDim.x * blockDim.y);
         cde::fence_proxy_async_shared_cta();
@@ -157,11 +158,17 @@ __global__ void producer_consumer_pattern(
     // Can increase block size to 16x32 for 3 consumer 1 producer
     if (tid < warpSize * 4) {
         // consumer
-        barrier::arrival_token token1 = bar_ready[0].arrive(); // buffer 0 is ready for initial fill 
-        barrier::arrival_token token2 = bar_ready[1].arrive(); // buffer 1 is ready for initial fill 
+        for (int i = 0; i < DEPTH; ++i) {
+            bar_ready[i].arrive(); // buffers are made ready for initial fill
+        }
         for (int c = 0; c < IN_C; ++c) {
-            bar_filled[c%2].arrive_and_wait();
-            float (*cur_buf)[TILE_W_PAD] = (c%2==0) ? smem_buf0 : smem_buf1;
+            int buf = c % DEPTH;
+            bar_filled[buf].arrive_and_wait();
+            float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
+            if (tid == 0) {
+                printf("Computing on channel %d for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
+                printf("Printing out section of current buffer %d for block (%d, %d) for reference: %f, %f, %f, %f \n", buf, blockIdx.x, blockIdx.y, cur_buf[0][0], cur_buf[0][1], cur_buf[1][0], cur_buf[1][1]);
+            }
             for (int i = tid; i < BLOCK_SIZE*BLOCK_SIZE; i += warpSize * 4) {
                 int local_y = i / BLOCK_SIZE;
                 int local_x = i % BLOCK_SIZE;
@@ -177,7 +184,7 @@ __global__ void producer_consumer_pattern(
                 }
                 smem_out[local_y][local_x] += accum;
             }
-            barrier::arrival_token token = bar_ready[c%2].arrive();
+            barrier::arrival_token token = bar_ready[buf].arrive();
         }
 
     }
@@ -186,23 +193,24 @@ __global__ void producer_consumer_pattern(
         // TODO: give up registers with "setmaxnreg" inline PTX 
         for (int c = 0; c < IN_C; ++c) {
             // Determine which buffer to load into
-            float (*cur_buf)[TILE_W_PAD] = (c%2==0) ? smem_buf0 : smem_buf1;
-            bar_ready[c%2].arrive_and_wait();
+            int buf = c % DEPTH;
+            float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
+            bar_ready[buf].arrive_and_wait();
             barrier::arrival_token t_load;
             if (tid == 128) {
-                // printf("reading channel %d from global for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
+                printf("reading channel %d from global for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
                 cde::cp_async_bulk_tensor_3d_global_to_shared(
                     &cur_buf[0][0],
                     &input_map,
                     blockIdx.x*BLOCK_SIZE,
                     blockIdx.y*BLOCK_SIZE,
                     c,
-                    bar_filled[c%2]
+                    bar_filled[buf]
                 );
-                t_load = cuda::device::barrier_arrive_tx(bar_filled[c%2], 1, SH_TILE_W * TILE_W_PAD * sizeof(float));
+                t_load = cuda::device::barrier_arrive_tx(bar_filled[buf], 1, SH_TILE_W * TILE_W_PAD * sizeof(float));
             }
             else {
-                t_load = bar_filled[c%2].arrive();
+                t_load = bar_filled[buf].arrive();
             }
         }
     }
@@ -259,9 +267,7 @@ void launch_conv2d_tma(torch::Tensor input, torch::Tensor kernel, torch::Tensor 
     // Kernel launch
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);  // z-dim needed due to TMA rules
     dim3 blocks(
-        // (OUT_W + BLOCK_SIZE - 1) / BLOCK_SIZE,
-        // (OUT_H + BLOCK_SIZE - 1) / BLOCK_SIZE
-        H / BLOCK_SIZE, W / BLOCK_SIZE
+        H / BLOCK_SIZE, W / BLOCK_SIZE  // Fine since H, W are larger than OUT_H, OUT_W
     );
 
     producer_consumer_pattern<<<blocks, threads>>>(
