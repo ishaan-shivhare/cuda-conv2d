@@ -105,154 +105,6 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
     }
 }
 
-// __launch_bounds__(256,8)
-// __global__ void producer_consumer_pattern(
-//     const __grid_constant__ CUtensorMap input_map,
-//     const __grid_constant__ CUtensorMap output_map,
-//     float* kernel,
-//     float* out,
-//     int OUT_H,
-//     int OUT_W,
-//     float* inp,
-//     int H,
-//     int W,
-//     int padded_out_w
-// ) {
-//     // Shared tiles
-//     __shared__ alignas(128) float smem_buf0[SH_TILE_W][TILE_W_PAD];
-//     __shared__ alignas(128) float smem_buf1[SH_TILE_W][TILE_W_PAD];
-//     __shared__ alignas(128) float smem_out[BLOCK_SIZE][BLOCK_SIZE];
-//     __shared__ float          smem_kernel[IN_C][K][K];
-//     __shared__ barrier        bar_filled[2];
-
-//     // Thread index helpers
-//     int tid = threadIdx.y*blockDim.x + threadIdx.x;
-//     int lane_count = blockDim.x*blockDim.y;
-
-//     // Init the “filled” barriers once
-//     if (tid == 0) {
-//         init(&bar_filled[0], lane_count);
-//         init(&bar_filled[1], lane_count);
-//         cde::fence_proxy_async_shared_cta();
-//     }
-
-//     // Load kernel into SMEM
-//     for (int i = tid; i < IN_C * K * K; i += lane_count) {
-//         int c  = i / (K*K);
-//         int kk = i % (K*K);
-//         int ky = kk / K, kx = kk % K;
-//         smem_kernel[c][ky][kx] = kernel[c*K*K + ky*K + kx];
-//     }
-
-//     // Zero out smem_out
-    
-//     for (int i = threadIdx.y*blockDim.x + threadIdx.x; i < BLOCK_SIZE*BLOCK_SIZE; i += blockDim.x*blockDim.y) {
-//         int y = i / BLOCK_SIZE, x = i % BLOCK_SIZE;
-//         smem_out[y][x] = 0.0f;
-//     }
-    
-//     __syncthreads();
-
-//     // Pre‑load chunk 0 into buf 0
-//     barrier::arrival_token t0;
-//     if (tid == 0) {
-//         cde::cp_async_bulk_tensor_3d_global_to_shared(
-//             &smem_buf0[0][0],
-//             &input_map,
-//             blockIdx.x*BLOCK_SIZE,
-//             blockIdx.y*BLOCK_SIZE,
-//             0,
-//             bar_filled[0]
-//         );
-//         t0 = cuda::device::barrier_arrive_tx(
-//             bar_filled[0], 1,
-//             SH_TILE_W * TILE_W_PAD * sizeof(float)
-//         );
-//     }
-//     else {
-//         t0 = bar_filled[0].arrive();
-//     }
-
-//     // wait + flush buf0
-//     bar_filled[0].wait(std::move(t0));
-//     // cde::fence_proxy_async_shared_cta();
-//     // __syncthreads();
-
-//     int buf = 0;
-//     // Main pipeline loop
-//     for (int c = 0; c < IN_C; ++c) {
-        
-//         // Prefetch next
-//         int next_c = c + 1;
-//         int next_buf = buf ^ 1;
-//         barrier::arrival_token tn;        
-
-//         // 1) Kick off prefetch of next chunk into next_buf
-//         float (*cur_buf)[TILE_W_PAD] = (buf==0) ? smem_buf0 : smem_buf1;
-        
-//         if (next_c < IN_C){
-//             if (tid == 0) {
-//                 cde::cp_async_bulk_tensor_3d_global_to_shared(
-//                     &((next_buf==0 ? smem_buf0 : smem_buf1))[0][0],
-//                     &input_map,
-//                     blockIdx.x*BLOCK_SIZE,
-//                     blockIdx.y*BLOCK_SIZE,
-//                     next_c,
-//                     bar_filled[next_buf]
-//                 );
-//                 tn = cuda::device::barrier_arrive_tx(
-//                         bar_filled[next_buf], 1,
-//                         SH_TILE_W * TILE_W_PAD * sizeof(float)
-//                 );
-//             } else {
-//                 tn = bar_filled[next_buf].arrive();
-//             }
-//         }
-        
-        
-//         int global_y = blockIdx.y*BLOCK_SIZE + threadIdx.y;
-//         int global_x = blockIdx.x*BLOCK_SIZE + threadIdx.x;
-//         if (global_y < OUT_H && global_x < OUT_W) {
-//             float accum = 0.0f;
-//             for (int ky = 0; ky < K; ++ky) {
-//                 for (int kx = 0; kx < K; ++kx) {
-//                     int sy = threadIdx.y + ky; 
-//                     int sx = threadIdx.x + kx;
-//                     if (sy < SH_TILE_W && sx < SH_TILE_W) {
-//                         accum += cur_buf[sy][sx] * smem_kernel[c][ky][kx];
-//                     }
-//                 }
-//             }
-//             smem_out[threadIdx.y][threadIdx.x] += accum;
-//         }
-
-//         // 3) Wait + flush next_buf (so it's ready for next iteration)
-//         if (next_c < IN_C) {
-//             bar_filled[next_buf].wait(std::move(tn));
-//             // cde::fence_proxy_async_shared_cta();
-//             // __syncthreads();
-//         }
-
-//         buf = next_buf;
-//     }
-
-    
-//     cde::fence_proxy_async_shared_cta();
-//     __syncthreads();
-//     // Final TMA store of smem_out → global
-//     if (tid == 0) {
-//         // printf("Committing output tile for block (%d, %d)\n", blockIdx.x, blockIdx.y);
-//         cde::cp_async_bulk_tensor_2d_shared_to_global(
-//             &output_map,
-//             blockIdx.x*BLOCK_SIZE,
-//             blockIdx.y*BLOCK_SIZE,
-//             &smem_out[0][0]
-//         );
-//         cde::cp_async_bulk_commit_group();
-//         cde::cp_async_bulk_wait_group_read<0>();
-//     }
-// }
-
 __global__ void producer_consumer_pattern(
     const __grid_constant__ CUtensorMap input_map,
     const __grid_constant__ CUtensorMap output_map,
@@ -310,24 +162,20 @@ __global__ void producer_consumer_pattern(
         for (int c = 0; c < IN_C; ++c) {
             bar_filled[c%2].arrive_and_wait();
             float (*cur_buf)[TILE_W_PAD] = (c%2==0) ? smem_buf0 : smem_buf1;
-            if (tid == 0) {
-                printf("Computing on channel %d for block %d, %d \n", c, blockIdx.x, blockIdx.y);
-                printf("Printing out section of current buffer %d for reference: %d, %d, %d, %d \n", c%2, cur_buf[0][0], cur_buf[0][1], cur_buf[1][0], cur_buf[1][1]);
-            }
-            for (int global_y = blockIdx.y * BLOCK_SIZE + threadIdx.y; global_y < OUT_H; global_y += BLOCK_SIZE) {
-                for (int global_x = blockIdx.x * BLOCK_SIZE + threadIdx.x; global_x < OUT_W; global_x += BLOCK_SIZE) {
-                    float accum = 0.0f;
-                    for (int ky = 0; ky < K; ++ky) {
-                        for (int kx = 0; kx < K; ++kx) {
-                            int sy = global_y - blockIdx.y * BLOCK_SIZE + ky;
-                            int sx = global_x - blockIdx.x * BLOCK_SIZE + kx;
-                            if (sy < SH_TILE_W && sx < SH_TILE_W) {
-                                accum += cur_buf[sy][sx] * smem_kernel[c][ky][kx];
-                            }
+            for (int i = tid; i < BLOCK_SIZE*BLOCK_SIZE; i += warpSize * 4) {
+                int local_y = i / BLOCK_SIZE;
+                int local_x = i % BLOCK_SIZE;
+                float accum = 0.0f;
+                for (int ky = 0; ky < K; ++ky) {
+                    for (int kx = 0; kx < K; ++kx) {
+                        int sy = local_y + ky;
+                        int sx = local_x + kx;
+                        if (sy < SH_TILE_W && sx < SH_TILE_W) {
+                            accum += cur_buf[sy][sx] * smem_kernel[c][ky][kx];
                         }
                     }
-                    smem_out[global_y - blockIdx.y * BLOCK_SIZE][global_x - blockIdx.x * BLOCK_SIZE] += accum;
                 }
+                smem_out[local_y][local_x] += accum;
             }
             barrier::arrival_token token = bar_ready[c%2].arrive();
         }
@@ -342,7 +190,7 @@ __global__ void producer_consumer_pattern(
             bar_ready[c%2].arrive_and_wait();
             barrier::arrival_token t_load;
             if (tid == 128) {
-                printf("reading channel %d from global for block %d, %d \n", c, blockIdx.x, blockIdx.y);
+                // printf("reading channel %d from global for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
                 cde::cp_async_bulk_tensor_3d_global_to_shared(
                     &cur_buf[0][0],
                     &input_map,
@@ -352,7 +200,6 @@ __global__ void producer_consumer_pattern(
                     bar_filled[c%2]
                 );
                 t_load = cuda::device::barrier_arrive_tx(bar_filled[c%2], 1, SH_TILE_W * TILE_W_PAD * sizeof(float));
-                bar_filled[c%2].wait(std::move(t_load))
             }
             else {
                 t_load = bar_filled[c%2].arrive();
