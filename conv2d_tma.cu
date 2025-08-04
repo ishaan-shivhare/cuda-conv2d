@@ -105,6 +105,7 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
     }
 }
 
+__launch_bounds__(256, 8)
 __global__ void producer_consumer_pattern(
     const __grid_constant__ CUtensorMap input_map,
     const __grid_constant__ CUtensorMap output_map,
@@ -190,7 +191,8 @@ __global__ void producer_consumer_pattern(
     }
     else {
         // producer
-        // TODO: give up registers with "setmaxnreg" inline PTX 
+        // Give up registers with "setmaxnreg"
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
         for (int c = 0; c < IN_C; ++c) {
             // Determine which buffer to load into
             int buf = c % DEPTH;
@@ -198,7 +200,7 @@ __global__ void producer_consumer_pattern(
             bar_ready[buf].arrive_and_wait();
             barrier::arrival_token t_load;
             if (tid == 128) {
-                printf("reading channel %d from global for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
+                // printf("reading channel %d from global for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
                 cde::cp_async_bulk_tensor_3d_global_to_shared(
                     &cur_buf[0][0],
                     &input_map,
