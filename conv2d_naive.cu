@@ -127,6 +127,7 @@ __global__ void conv2d_shared_multi_in_kernel(
                 }
             }
             // sh_output[threadIdx.y * blockDim.x + threadIdx.x] += accum;
+            // should replace with atomicAdd_block scope instead
             atomicAdd(&sh_output[threadIdx.y * blockDim.x + threadIdx.x], accum);   // if we guarantee IN_C <= 32, we could assign x axis to channel dim and do a warp shuffle reduction
         }
     }
