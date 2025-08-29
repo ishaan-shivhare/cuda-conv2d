@@ -7,12 +7,12 @@
 #include <torch/extension.h>
 
 constexpr int BLOCK_SIZE = 16;
-constexpr int BLOCK_DEPTH = 8;
-constexpr int DEPTH = 3;
+constexpr int BLOCK_DEPTH = 8; // number of output channels this block will process
+constexpr int DEPTH = 3; // pipeline depth
 constexpr int K = 3;
 constexpr int SH_TILE_W = BLOCK_SIZE + K - 1;
 constexpr int IN_C = 3;
-constexpr int OUT_C = 3;
+constexpr int OUT_C = 16;
 constexpr int TILE_W_PAD = ((SH_TILE_W + 3) / 4) * 4; // round up
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
@@ -133,9 +133,9 @@ __global__ void producer_consumer_pattern(
         float data[SH_TILE_W][TILE_W_PAD];
     };
     
-    __shared__  SmemTile smem_buf[DEPTH];
-    __shared__ alignas(128) float smem_out[BLOCK_DEPTH][BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ float smem_kernel[DEPTH][BLOCK_DEPTH][K][K]; // Will load in channel-wise for BLOCK_DEPTH filters
+    __shared__  SmemTile smem_buf[DEPTH]; // ring buffer for input
+    __shared__ alignas(128) float smem_out[BLOCK_DEPTH][BLOCK_SIZE][BLOCK_SIZE]; // holds results we will write back
+    __shared__ float smem_kernel[DEPTH][BLOCK_DEPTH][K][K]; // buffer for BLOCK_DEPTH kernels of corresponding channel
     __shared__ barrier bar_ready[DEPTH]; // track if buffers are ready to be filled,
     __shared__ barrier bar_filled[DEPTH]; // track if buffers are filled-in respectively
 
@@ -147,23 +147,16 @@ __global__ void producer_consumer_pattern(
     }
     
     int oc_offset = BLOCK_DEPTH * blockIdx.z;
-    // // Load kernel into SMEM
-    // for (int i = tid; i < BLOCK_DEPTH * IN_C * K * K; i += blockDim.x * blockDim.y) {
-    //     int o_c = i / (IN_C*K*K);
-    //     int inner = i % (IN_C*K*K);
-    //     int c  = inner / (K*K);
-    //     int kk = inner % (K*K);
-    //     int ky = kk / K, kx = kk % K;
-    //     smem_kernel[o_c][c][ky][kx] = kernel[(oc_offset + o_c)*IN_C*K*K +  c*K*K + ky*K + kx];
-    // }
-    
+    const int g_eff   = max(0, min(BLOCK_DEPTH, OUT_C - oc_offset));
+
     // Zero out smem_out
-    for (int i = tid; i < BLOCK_DEPTH*BLOCK_SIZE*BLOCK_SIZE; i += blockDim.x * blockDim.y) {
-        int z = i / BLOCK_SIZE*BLOCK_SIZE, 
+    for (int i = tid; i < g_eff*BLOCK_SIZE*BLOCK_SIZE; i += blockDim.x * blockDim.y) {
+        int z = i / (BLOCK_SIZE*BLOCK_SIZE); 
         int inner = i % BLOCK_SIZE*BLOCK_SIZE;
         int y = inner / BLOCK_SIZE, x = inner % BLOCK_SIZE;
         smem_out[z][y][x] = 0.0f;
     }
+    
     
     // Sync to make barriers, zeroed out accumulator visible to everyone
     __syncthreads();
@@ -183,20 +176,22 @@ __global__ void producer_consumer_pattern(
             //     printf("Computing on channel %d for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
             //     printf("Printing out section of current buffer %d for block (%d, %d) for reference: %f, %f, %f, %f \n", buf, blockIdx.x, blockIdx.y, cur_buf[0][0], cur_buf[0][1], cur_buf[1][0], cur_buf[1][1]);
             // }
-            for (int i = tid; i < BLOCK_SIZE*BLOCK_SIZE; i += warpSize * 4) {
-                int local_y = i / BLOCK_SIZE;
-                int local_x = i % BLOCK_SIZE;
-                float accum = 0.0f;
-                for (int ky = 0; ky < K; ++ky) {
-                    for (int kx = 0; kx < K; ++kx) {
-                        int sy = local_y + ky;
-                        int sx = local_x + kx;
-                        if (sy < SH_TILE_W && sx < SH_TILE_W) {
-                            accum += cur_buf[sy][sx] * smem_kernel[c][ky][kx];
+            for (int oc = 0; oc < g_eff; oc += 1) {
+                for (int i = tid; i < BLOCK_SIZE*BLOCK_SIZE; i += warpSize * 4) {
+                    int local_y = i / BLOCK_SIZE;
+                    int local_x = i % BLOCK_SIZE;
+                    float accum = 0.0f;
+                    for (int ky = 0; ky < K; ++ky) {
+                        for (int kx = 0; kx < K; ++kx) {
+                            int sy = local_y + ky;
+                            int sx = local_x + kx;
+                            if (sy < SH_TILE_W && sx < SH_TILE_W) {
+                                accum += cur_buf[sy][sx] * smem_kernel[buf][oc][ky][kx];
+                            }
                         }
                     }
+                    smem_out[oc][local_y][local_x] += accum;
                 }
-                smem_out[local_y][local_x] += accum;
             }
             barrier::arrival_token token = bar_ready[buf].arrive();
         }
@@ -225,6 +220,16 @@ __global__ void producer_consumer_pattern(
                 t_load = cuda::device::barrier_arrive_tx(bar_filled[buf], 1, SH_TILE_W * TILE_W_PAD * sizeof(float));
             }
             else {
+                // load corresponding kernels in 
+                int rel_tid = tid - warpSize*4 - 1; // since thread 128 won't execute this part
+                for (int i = rel_tid; i < g_eff*K*K; i += warpSize*4) {
+                    // now to determine what it will load and where to. consective threads should load in one whole filter
+                    int out_c = i / (K*K);
+                    int inner = i % (K*K);
+                    int row = inner / K;
+                    int col = inner % K;
+                    smem_kernel[buf][out_c][row][col] = kernel[(out_c + oc_offset)*IN_C*K*K + c*K*K + row*K + col];
+                }
                 t_load = bar_filled[buf].arrive();
             }
         }
@@ -235,18 +240,19 @@ __global__ void producer_consumer_pattern(
     // Final TMA store of smem_out → global
     if (tid == 0) {
         // printf("Committing output tile for block (%d, %d)\n", blockIdx.x, blockIdx.y);
-        cde::cp_async_bulk_tensor_2d_shared_to_global(
+        cde::cp_async_bulk_tensor_3d_shared_to_global(
             &output_map,
             blockIdx.x*BLOCK_SIZE,
             blockIdx.y*BLOCK_SIZE,
-            &smem_out[0][0]
+            oc_offset,
+            &smem_out[0][0][0]
         );
         cde::cp_async_bulk_commit_group();
         cde::cp_async_bulk_wait_group_read<0>();
     }
 }
 
-void launch_conv2d_tma(torch::Tensor input, torch::Tensor kernel, torch::Tensor output, int padded_out_h, int padded_out_w) {
+void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tensor output, int padded_out_h, int padded_out_w) {
     TORCH_CHECK(input.device().is_cuda(), "input must be a CUDA tensor");
     TORCH_CHECK(kernel.device().is_cuda(), "kernel must be a CUDA tensor");
     TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
@@ -255,13 +261,13 @@ void launch_conv2d_tma(torch::Tensor input, torch::Tensor kernel, torch::Tensor 
     TORCH_CHECK(kernel.dtype() == torch::kFloat32, "kernel must be float32");
     TORCH_CHECK(output.dtype() == torch::kFloat32, "output must be float32");
 
-    TORCH_CHECK(input.dim() == 3, "input must be [C, H, W]");
-    TORCH_CHECK(kernel.dim() == 3, "kernel must be [C, K, K]");
-    TORCH_CHECK(output.dim() == 2, "output must be [H_out, W_out]");
+    // TORCH_CHECK(input.dim() == 3, "input must be [C, H, W]");
+    // TORCH_CHECK(kernel.dim() == 3, "kernel must be [C, K, K]");
+    // TORCH_CHECK(output.dim() == 2, "output must be [H_out, W_out]");
 
-    TORCH_CHECK(input.size(0) == IN_C, "IN_C mismatch");
-    TORCH_CHECK(kernel.size(0) == IN_C, "IN_C mismatch");
-    TORCH_CHECK(kernel.size(1) == K && kernel.size(2) == K, "Kernel shape mismatch");
+    // TORCH_CHECK(input.size(0) == IN_C, "IN_C mismatch");
+    // TORCH_CHECK(kernel.size(0) == IN_C, "IN_C mismatch");
+    // TORCH_CHECK(kernel.size(1) == K && kernel.size(2) == K, "Kernel shape mismatch");
 
     int H = input.size(1);
     int W = input.size(2);
