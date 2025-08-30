@@ -168,34 +168,76 @@ __global__ void producer_consumer_pattern(
         for (int i = 0; i < DEPTH; ++i) {
             bar_ready[i].arrive(); // buffers are made ready for initial fill
         }
+        // for (int c = 0; c < IN_C; ++c) {
+        //     int buf = c % DEPTH;
+        //     bar_filled[buf].arrive_and_wait();
+        //     float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
+        //     // if (tid == 0) {
+        //     //     printf("Computing on channel %d for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
+        //     //     printf("Printing out section of current buffer %d for block (%d, %d) for reference: %f, %f, %f, %f \n", buf, blockIdx.x, blockIdx.y, cur_buf[0][0], cur_buf[0][1], cur_buf[1][0], cur_buf[1][1]);
+        //     // }
+        //     for (int oc = 0; oc < g_eff; oc += 1) {
+        //         for (int i = tid; i < BLOCK_SIZE*BLOCK_SIZE; i += warpSize * 4) {
+        //             int local_y = i / BLOCK_SIZE;
+        //             int local_x = i % BLOCK_SIZE;
+        //             float accum = 0.0f;
+        //             for (int ky = 0; ky < K; ++ky) {
+        //                 for (int kx = 0; kx < K; ++kx) {
+        //                     int sy = local_y + ky;
+        //                     int sx = local_x + kx;
+        //                     if (sy < SH_TILE_W && sx < SH_TILE_W) {
+        //                         accum += cur_buf[sy][sx] * smem_kernel[buf][oc][ky][kx];
+        //                     }
+        //                 }
+        //             }
+        //             smem_out[oc][local_y][local_x] += accum;
+        //         }
+        //     }
+        //     barrier::arrival_token token = bar_ready[buf].arrive();
+        // }
+
+        const int NPIX = BLOCK_SIZE * BLOCK_SIZE;
+        const int num_consumers = warpSize * 4;
+        constexpr int WARP_SZ = 32; // warpSize
+        constexpr int SLOTS_MAX = (BLOCK_SIZE*BLOCK_SIZE + (WARP_SZ*4) - 1) / (WARP_SZ*4); // how many output pixels each consumer thread calculates, compile time constant
+        float acc_slots[SLOTS_MAX][BLOCK_DEPTH]; // thus we can alleviate per thread register pressure by reucing work per block (i.e reducing BLOCK_DEPTH). But that also decreases input reuse
+        // zero out accumulators-per-thread
+        for (int s = 0; s < SLOTS_MAX; ++s) {
+            for (int oc = 0; oc < g_eff; ++oc) {
+                acc_slots[s][oc] = 0.0f;
+            }
+        }
+
         for (int c = 0; c < IN_C; ++c) {
             int buf = c % DEPTH;
             bar_filled[buf].arrive_and_wait();
             float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
-            // if (tid == 0) {
-            //     printf("Computing on channel %d for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
-            //     printf("Printing out section of current buffer %d for block (%d, %d) for reference: %f, %f, %f, %f \n", buf, blockIdx.x, blockIdx.y, cur_buf[0][0], cur_buf[0][1], cur_buf[1][0], cur_buf[1][1]);
-            // }
-            for (int oc = 0; oc < g_eff; oc += 1) {
-                for (int i = tid; i < BLOCK_SIZE*BLOCK_SIZE; i += warpSize * 4) {
-                    int local_y = i / BLOCK_SIZE;
-                    int local_x = i % BLOCK_SIZE;
-                    float accum = 0.0f;
-                    for (int ky = 0; ky < K; ++ky) {
-                        for (int kx = 0; kx < K; ++kx) {
-                            int sy = local_y + ky;
-                            int sx = local_x + kx;
-                            if (sy < SH_TILE_W && sx < SH_TILE_W) {
-                                accum += cur_buf[sy][sx] * smem_kernel[buf][oc][ky][kx];
-                            }
+
+            // process all pixels owned by this thread
+            for (int i = tid, s = 0; i < BLOCK_SIZE*BLOCK_SIZE; i += num_consumers, ++s) {
+                // calculates top left corner of convolution window
+                int ly = i / BLOCK_SIZE;
+                int lx = i % BLOCK_SIZE;
+                
+                for (int ky = 0; ky < K; ++ky) {
+                    float* row = &cur_buf[ly + ky][lx]; // can incorporate stride here
+                    for (int kx = 0; kx < K; ++kx) {
+                        float x = row[kx]; // load value to register
+                        for (int oc = 0; oc < g_eff; ++oc) {
+                            acc_slots[s][oc] += x * smem_kernel[buf][oc][ky][kx];
                         }
                     }
-                    smem_out[oc][local_y][local_x] += accum;
                 }
             }
             barrier::arrival_token token = bar_ready[buf].arrive();
         }
 
+        for (int i = tid, s = 0; i < NPIX; i += num_consumers, ++s) {
+            int ly = i / BLOCK_SIZE, lx = i % BLOCK_SIZE;
+            for (int oc = 0; oc < g_eff; ++oc) {
+                smem_out[oc][ly][lx] = acc_slots[s][oc];
+            }
+        } 
     }
     else {
         // producer
