@@ -152,7 +152,7 @@ __global__ void producer_consumer_pattern(
     // Zero out smem_out
     for (int i = tid; i < g_eff*BLOCK_SIZE*BLOCK_SIZE; i += blockDim.x * blockDim.y) {
         int z = i / (BLOCK_SIZE*BLOCK_SIZE); 
-        int inner = i % BLOCK_SIZE*BLOCK_SIZE;
+        int inner = i % (BLOCK_SIZE*BLOCK_SIZE);
         int y = inner / BLOCK_SIZE, x = inner % BLOCK_SIZE;
         smem_out[z][y][x] = 0.0f;
     }
@@ -288,7 +288,7 @@ void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tens
     // Kernel launch
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);  // z-dim needed due to TMA rules
     dim3 blocks(
-        H / BLOCK_SIZE, W / BLOCK_SIZE  // Fine since H, W are larger than OUT_H, OUT_W
+        H / BLOCK_SIZE, W / BLOCK_SIZE, ((OUT_C + BLOCK_DEPTH - 1) / BLOCK_DEPTH)  // Fine since H, W are larger than OUT_H, OUT_W
     );
 
     producer_consumer_pattern<<<blocks, threads>>>(
