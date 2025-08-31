@@ -6,14 +6,12 @@
 #include <cudaTypedefs.h>  // PFN_cuTensorMapEncodeTiled
 #include <torch/extension.h>
 
-constexpr int BLOCK_SIZE = 16;
+constexpr int BLOCK_SIZE = 16; 
 constexpr int BLOCK_DEPTH = 8; // number of output channels this block will process
 constexpr int DEPTH = 3; // pipeline depth
 constexpr int K = 3;
-constexpr int SH_TILE_W = BLOCK_SIZE + K - 1;
 constexpr int IN_C = 3;
 constexpr int OUT_C = 16;
-constexpr int TILE_W_PAD = ((SH_TILE_W + 3) / 4) * 4; // round up
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
@@ -51,16 +49,17 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
                        void* d_input, void* d_output,
                        int IN_C, int H, int W,
                        int padded_out_h, int padded_out_w,
+                       int sh_tile_h, int tile_w_pad,
                        int BLOCK_SIZE) {
-    constexpr uint32_t RANK = 3;
-    constexpr uint32_t RANK_OUT = 3;
+    
+    constexpr uint32_t RANK = 3, RANK_OUT = 3;
 
     uint64_t input_dims[RANK] = {static_cast<uint64_t>(W), static_cast<uint64_t>(H), static_cast<uint64_t>(IN_C)};
     uint64_t input_strides[RANK - 1] = {
         static_cast<uint64_t>(W * sizeof(float)),
         static_cast<uint64_t>(H * W * sizeof(float))
     };
-    uint32_t input_box[RANK] = {static_cast<uint32_t>(TILE_W_PAD), static_cast<uint32_t>(SH_TILE_W), 1};
+    uint32_t input_box[RANK] = {static_cast<uint32_t>(tile_w_pad), static_cast<uint32_t>(sh_tile_h), 1};
     uint32_t input_elem_stride[RANK] = {1, 1, 1};
 
     uint64_t output_dims[RANK_OUT] = {static_cast<uint64_t>(padded_out_w), static_cast<uint64_t>(padded_out_h), static_cast<uint64_t>(OUT_C)};
@@ -114,6 +113,15 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
     }
 }
 
+__device__ __forceinline__ float* in_tile(float* base, int buf, int y, int x,
+        int plane_stride_elems, int pitch_elems)
+    {
+        return base
+            + (size_t)buf * (size_t)plane_stride_elems
+            + (size_t)y   * (size_t)pitch_elems
+            + (size_t)x;
+    }
+
 __launch_bounds__(256, 8)
 __global__ void producer_consumer_pattern(
     const __grid_constant__ CUtensorMap input_map,
@@ -125,15 +133,19 @@ __global__ void producer_consumer_pattern(
     float* inp,
     int H,
     int W,
-    int padded_out_w
+    int padded_out_w, 
+    int stride_y, int stride_x,
+    int sh_tile_h, int tile_w_pad, int plane_stride_elems
 ) {
 
     // Aligned buffers for TMA
-    struct alignas(128) SmemTile {
-        float data[SH_TILE_W][TILE_W_PAD];
-    };
+    // struct alignas(128) SmemTile {
+    //     float data[SH_TILE_W][TILE_W_PAD];
+    // };
     
-    __shared__  SmemTile smem_buf[DEPTH]; // ring buffer for input
+    // __shared__  SmemTile smem_buf[DEPTH]; // ring buffer for input
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    float* smem_in = reinterpret_cast<float*>(smem_raw);
     __shared__ alignas(128) float smem_out[BLOCK_DEPTH][BLOCK_SIZE][BLOCK_SIZE]; // holds results we will write back
     __shared__ float smem_kernel[DEPTH][BLOCK_DEPTH][K][K]; // buffer for BLOCK_DEPTH kernels of corresponding channel
     __shared__ barrier bar_ready[DEPTH]; // track if buffers are ready to be filled,
@@ -211,16 +223,18 @@ __global__ void producer_consumer_pattern(
         for (int c = 0; c < IN_C; ++c) {
             int buf = c % DEPTH;
             bar_filled[buf].arrive_and_wait();
-            float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
+            // float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
+            float* tile0 = in_tile(smem_in, buf, 0, 0, plane_stride_elems, tile_w_pad);
 
             // process all pixels owned by this thread
-            for (int i = tid, s = 0; i < BLOCK_SIZE*BLOCK_SIZE; i += num_consumers, ++s) {
+            for (int i = tid, s = 0; i < NPIX; i += num_consumers, ++s) {
                 // calculates top left corner of convolution window
                 int ly = i / BLOCK_SIZE;
                 int lx = i % BLOCK_SIZE;
                 
                 for (int ky = 0; ky < K; ++ky) {
-                    float* row = &cur_buf[ly + ky][lx]; // can incorporate stride here
+                    // float* row = &cur_buf[ly + ky][lx]; // stride-less
+                    float* row = tile0 + (ly * stride_y + ky) * tile_w_pad + lx * stride_x;
                     for (int kx = 0; kx < K; ++kx) {
                         float x = row[kx]; // load value to register
                         for (int oc = 0; oc < g_eff; ++oc) {
@@ -246,20 +260,21 @@ __global__ void producer_consumer_pattern(
         for (int c = 0; c < IN_C; ++c) {
             // Determine which buffer to load into
             int buf = c % DEPTH;
-            float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
+            // float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
+            float* dst = in_tile(smem_in, buf, 0, 0, plane_stride_elems, tile_w_pad);
             bar_ready[buf].arrive_and_wait();
             barrier::arrival_token t_load;
             if (tid == 128) {
                 // printf("reading channel %d from global for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
                 cde::cp_async_bulk_tensor_3d_global_to_shared(
-                    &cur_buf[0][0],
+                    dst,
                     &input_map,
-                    blockIdx.x*BLOCK_SIZE,
-                    blockIdx.y*BLOCK_SIZE,
+                    blockIdx.x * BLOCK_SIZE * stride_x,
+                    blockIdx.y * BLOCK_SIZE * stride_y,
                     c,
                     bar_filled[buf]
                 );
-                t_load = cuda::device::barrier_arrive_tx(bar_filled[buf], 1, SH_TILE_W * TILE_W_PAD * sizeof(float));
+                t_load = cuda::device::barrier_arrive_tx(bar_filled[buf], 1, sh_tile_h * tile_w_pad * sizeof(float));
             }
             else {
                 // load corresponding kernels in 
@@ -294,28 +309,27 @@ __global__ void producer_consumer_pattern(
     }
 }
 
-void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tensor output, int padded_out_h, int padded_out_w) {
-    TORCH_CHECK(input.device().is_cuda(), "input must be a CUDA tensor");
-    TORCH_CHECK(kernel.device().is_cuda(), "kernel must be a CUDA tensor");
-    TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
+void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tensor output, int stride_h, int stride_w) {
 
-    TORCH_CHECK(input.dtype() == torch::kFloat32, "input must be float32");
-    TORCH_CHECK(kernel.dtype() == torch::kFloat32, "kernel must be float32");
-    TORCH_CHECK(output.dtype() == torch::kFloat32, "output must be float32");
-
-    // TORCH_CHECK(input.dim() == 3, "input must be [C, H, W]");
-    // TORCH_CHECK(kernel.dim() == 3, "kernel must be [C, K, K]");
-    // TORCH_CHECK(output.dim() == 2, "output must be [H_out, W_out]");
-
-    // TORCH_CHECK(input.size(0) == IN_C, "IN_C mismatch");
-    // TORCH_CHECK(kernel.size(0) == IN_C, "IN_C mismatch");
-    // TORCH_CHECK(kernel.size(1) == K && kernel.size(2) == K, "Kernel shape mismatch");
-
+    int stride_y = stride_h;
+    int stride_x = stride_w;
+    
     int H = input.size(1);
     int W = input.size(2);
-    int OUT_H = H - K + 1;
-    int OUT_W = W - K + 1;
+    int OUT_H = (H - K) / stride_y + 1;
+    int OUT_W = (W - K) / stride_x + 1;
 
+    int padded_out_h = ((OUT_H + BLOCK_SIZE - 1)/BLOCK_SIZE)*BLOCK_SIZE;
+    int padded_out_w = ((OUT_W + BLOCK_SIZE - 1)/BLOCK_SIZE)*BLOCK_SIZE;
+
+    int sh_tile_h   = (BLOCK_SIZE - 1) * stride_y + K;
+    int sh_tile_w   = (BLOCK_SIZE - 1) * stride_x + K;
+    int tile_w_pad  = ((sh_tile_w + 3) / 4) * 4;   // 16B row pitch
+
+    size_t plane_elems  = (size_t)sh_tile_h * tile_w_pad;
+    size_t plane_stride_elems = ((plane_elems + 31) / 32) * 32;  // align plane to 128B (32 floats)
+    size_t smem_bytes   = (size_t)DEPTH * plane_stride_elems * sizeof(float);
+    
     // Setup tensor maps
     CUtensorMap input_map;
     CUtensorMap output_map;
@@ -324,26 +338,28 @@ void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tens
         input.data_ptr<float>(), output.data_ptr<float>(),
         IN_C, H, W,
         padded_out_h, padded_out_w,
+        sh_tile_h, tile_w_pad,
         BLOCK_SIZE
     );
 
     // Kernel launch
-    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);  // z-dim needed due to TMA rules
+    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);  
     dim3 blocks(
-        H / BLOCK_SIZE, W / BLOCK_SIZE, ((OUT_C + BLOCK_DEPTH - 1) / BLOCK_DEPTH)  // Fine since H, W are larger than OUT_H, OUT_W
+        (OUT_W + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+        (OUT_H + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+        ((OUT_C + BLOCK_DEPTH - 1) / BLOCK_DEPTH)  
     );
 
-    producer_consumer_pattern<<<blocks, threads>>>(
-        input_map,
-        output_map,
+    producer_consumer_pattern<<<blocks, threads, smem_bytes>>>(
+        input_map, output_map,
         kernel.data_ptr<float>(),
         output.data_ptr<float>(),
-        OUT_H,
-        OUT_W,
+        OUT_H, OUT_W,
         input.data_ptr<float>(),
-        H,
-        W,
-        padded_out_w
+        H, W,
+        padded_out_w,
+        stride_y, stride_x,
+        sh_tile_h, tile_w_pad, plane_stride_elems
     );
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
