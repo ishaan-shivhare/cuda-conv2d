@@ -62,14 +62,15 @@ PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled() {
 // Wraps input and output CUtensorMap creation
 void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
                        void* d_input, void* d_output,
-                       int IN_C, int H, int W,
+                       int N, int IN_C, int H, int W,
                        int padded_out_h, int padded_out_w,
+                       int C_OUT_PAD,
                        int sh_tile_h, int tile_w_pad,
                        int BLOCK_SIZE) {
     
     constexpr uint32_t RANK = 3, RANK_OUT = 3;
 
-    uint64_t input_dims[RANK] = {static_cast<uint64_t>(W), static_cast<uint64_t>(H), static_cast<uint64_t>(IN_C)};
+    uint64_t input_dims[RANK] = {static_cast<uint64_t>(W), static_cast<uint64_t>(H), static_cast<uint64_t>(N * IN_C)};
     uint64_t input_strides[RANK - 1] = {
         static_cast<uint64_t>(W * sizeof(float)),
         static_cast<uint64_t>(H * W * sizeof(float))
@@ -77,7 +78,7 @@ void setup_tensor_maps(CUtensorMap& input_map, CUtensorMap& output_map,
     uint32_t input_box[RANK] = {static_cast<uint32_t>(tile_w_pad), static_cast<uint32_t>(sh_tile_h), 1};
     uint32_t input_elem_stride[RANK] = {1, 1, 1};
 
-    uint64_t output_dims[RANK_OUT] = {static_cast<uint64_t>(padded_out_w), static_cast<uint64_t>(padded_out_h), static_cast<uint64_t>(OUT_C)};
+    uint64_t output_dims[RANK_OUT] = {static_cast<uint64_t>(padded_out_w), static_cast<uint64_t>(padded_out_h), static_cast<uint64_t>(N * C_OUT_PAD)};
     uint64_t output_strides[RANK_OUT - 1] = {
         static_cast<uint64_t>(padded_out_w * sizeof(float)),
         static_cast<uint64_t>(padded_out_w * padded_out_h * sizeof(float))
@@ -143,6 +144,7 @@ __global__ void producer_consumer_pattern(
     const __grid_constant__ CUtensorMap output_map,
     float* kernel,
     float* out,
+    int C_OUT_PAD,
     int OUT_H,
     int OUT_W,
     float* inp,
@@ -168,6 +170,14 @@ __global__ void producer_consumer_pattern(
     const bool is_consumer = (wg < CONSUMER_WGS);
     const bool is_producer = (wg >= CONSUMER_WGS) && (wg < CONSUMER_WGS + PRODUCER_WGS);
 
+    // Split blockIdx.z into (n, g_idx)
+    constexpr int GROUPS = (OUT_C + BLOCK_DEPTH - 1) / BLOCK_DEPTH;
+    const int n = blockIdx.z / GROUPS; // batch index
+    const int g_idx = blockIdx.z % GROUPS; // which output channel group
+    int oc_offset = g_idx * BLOCK_DEPTH;
+    const int g_eff = max(0, min(BLOCK_DEPTH, OUT_C - oc_offset));
+    
+
     static_assert((THREADS_PER_CTA % WG_SIZE) == 0, "CTA must be an integer # of warpgroups");
     static_assert((CONSUMER_WGS + PRODUCER_WGS) * WG_SIZE == THREADS_PER_CTA,
               "Role partition must cover the CTA exactly");
@@ -177,11 +187,8 @@ __global__ void producer_consumer_pattern(
         init(bar_filled + tid, THREADS_PER_CTA);
         cde::fence_proxy_async_shared_cta();
     }
-    
-    const int NPIX = BLOCK_SIZE * BLOCK_SIZE;
-    int oc_offset = BLOCK_DEPTH * blockIdx.z;
-    const int g_eff   = max(0, min(BLOCK_DEPTH, OUT_C - oc_offset));
 
+    const int NPIX = BLOCK_SIZE * BLOCK_SIZE;
     // Zero out smem_out
     for (int i = tid; i < g_eff * NPIX; i += THREADS_PER_CTA) {
         int z = i / (NPIX); 
@@ -256,7 +263,7 @@ __global__ void producer_consumer_pattern(
                     &input_map,
                     blockIdx.x * BLOCK_SIZE * stride_x,
                     blockIdx.y * BLOCK_SIZE * stride_y,
-                    c,
+                    n * IN_C + c, // plane = n*IN_C + C
                     bar_filled[buf]
                 );
                 t_load = cuda::device::barrier_arrive_tx(bar_filled[buf], 1, sh_tile_h * tile_w_pad * sizeof(float));
@@ -285,7 +292,7 @@ __global__ void producer_consumer_pattern(
             &output_map,
             blockIdx.x*BLOCK_SIZE,
             blockIdx.y*BLOCK_SIZE,
-            oc_offset,
+            n * C_OUT_PAD + oc_offset, // store plane = n*C_OUT_PAD + OC_offset
             &smem_out[0][0][0]
         );
         cde::cp_async_bulk_commit_group();
@@ -298,10 +305,15 @@ void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tens
     int stride_y = stride_h;
     int stride_x = stride_w;
     
-    int H = input.size(1);
-    int W = input.size(2);
+    int N = input.size(0);
+    int H = input.size(2);
+    int W = input.size(3);
+
     int OUT_H = (H - K) / stride_y + 1;
     int OUT_W = (W - K) / stride_x + 1;
+
+    constexpr int GROUPS = (OUT_C + BLOCK_DEPTH - 1) / BLOCK_DEPTH;
+    constexpr int C_OUT_PAD = GROUPS * BLOCK_DEPTH;
 
     int padded_out_h = ((OUT_H + BLOCK_SIZE - 1)/BLOCK_SIZE)*BLOCK_SIZE;
     int padded_out_w = ((OUT_W + BLOCK_SIZE - 1)/BLOCK_SIZE)*BLOCK_SIZE;
@@ -320,8 +332,9 @@ void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tens
     setup_tensor_maps(
         input_map, output_map,
         input.data_ptr<float>(), output.data_ptr<float>(),
-        IN_C, H, W,
+        N, IN_C, H, W,
         padded_out_h, padded_out_w,
+        C_OUT_PAD,
         sh_tile_h, tile_w_pad,
         BLOCK_SIZE
     );
@@ -331,14 +344,14 @@ void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tens
     dim3 blocks(
         (OUT_W + BLOCK_SIZE - 1) / BLOCK_SIZE, 
         (OUT_H + BLOCK_SIZE - 1) / BLOCK_SIZE, 
-        ((OUT_C + BLOCK_DEPTH - 1) / BLOCK_DEPTH)  
+        N * GROUPS  
     );
 
     producer_consumer_pattern<<<blocks, threads, smem_bytes>>>(
         input_map, output_map,
         kernel.data_ptr<float>(),
         output.data_ptr<float>(),
-        OUT_H, OUT_W,
+        C_OUT_PAD, OUT_H, OUT_W,
         input.data_ptr<float>(),
         H, W,
         padded_out_w,
