@@ -11,7 +11,7 @@ H = W = 512
 K = 3
 BLOCK_SIZE = 16
 BLOCK_DEPTH = 8
-sy = 3
+sy = 2
 sx = 3
 
 # Create multi-channel input and kernel

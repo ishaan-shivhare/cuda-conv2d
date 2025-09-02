@@ -6,15 +6,30 @@
 #include <cudaTypedefs.h>  // PFN_cuTensorMapEncodeTiled
 #include <torch/extension.h>
 
-constexpr int BLOCK_SIZE = 16; 
-constexpr int BLOCK_DEPTH = 8; // number of output channels this block will process
-constexpr int DEPTH = 3; // pipeline depth
-constexpr int K = 3;
-constexpr int IN_C = 3;
-constexpr int OUT_C = 16;
-
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
+
+// --------------------------- Tunables ---------------------------
+constexpr int BLOCK_SIZE  = 16; // logical output tile size per CTA (spatial dimension)
+constexpr int BLOCK_DEPTH = 8; // number of output channels per CTA
+constexpr int DEPTH       = 3; // input ring pipeline depth
+constexpr int K           = 3;
+constexpr int IN_C        = 3;
+constexpr int OUT_C       = 16;
+
+// Warpgroup specialization (Hopper): 1 warpgroup = 4 warps = 128 threads
+constexpr int WARP_SZ      = 32;
+constexpr int WARPS_PER_WG = 4;
+constexpr int WG_SIZE      = WARPS_PER_WG * WARP_SZ; // 128
+
+// Choose #consumer & #producer warpgroups (decoupled from BLOCK_SIZE)
+constexpr int CONSUMER_WGS = 1;  // 1 consumer warpgroup (128 threads)
+constexpr int PRODUCER_WGS = 1;  // 1 producer warpgroup (128 threads)
+
+// Derived
+constexpr int NUM_CONSUMERS   = CONSUMER_WGS * WG_SIZE;       // 128 threads
+constexpr int NUM_PRODUCERS   = PRODUCER_WGS * WG_SIZE;       // 128 threads
+constexpr int THREADS_PER_CTA = NUM_CONSUMERS + NUM_PRODUCERS; // 256
 
 #define CUDA_CHECK(err) do { \
     cudaError_t err_ = err; \
@@ -122,7 +137,7 @@ __device__ __forceinline__ float* in_tile(float* base, int buf, int y, int x,
             + (size_t)x;
     }
 
-__launch_bounds__(256, 8)
+__launch_bounds__(THREADS_PER_CTA, 8)
 __global__ void producer_consumer_pattern(
     const __grid_constant__ CUtensorMap input_map,
     const __grid_constant__ CUtensorMap output_map,
@@ -135,83 +150,58 @@ __global__ void producer_consumer_pattern(
     int W,
     int padded_out_w, 
     int stride_y, int stride_x,
-    int sh_tile_h, int tile_w_pad, int plane_stride_elems
-) {
+    int sh_tile_h, int tile_w_pad, int plane_stride_elems) 
+    {
 
-    // Aligned buffers for TMA
-    // struct alignas(128) SmemTile {
-    //     float data[SH_TILE_W][TILE_W_PAD];
-    // };
-    
-    // __shared__  SmemTile smem_buf[DEPTH]; // ring buffer for input
     extern __shared__ __align__(128) unsigned char smem_raw[];
     float* smem_in = reinterpret_cast<float*>(smem_raw);
-    __shared__ alignas(128) float smem_out[BLOCK_DEPTH][BLOCK_SIZE][BLOCK_SIZE]; // holds results we will write back
+
+    __shared__ alignas(128) float smem_out[BLOCK_DEPTH][BLOCK_SIZE][BLOCK_SIZE]; 
     __shared__ float smem_kernel[DEPTH][BLOCK_DEPTH][K][K]; // buffer for BLOCK_DEPTH kernels of corresponding channel
     __shared__ barrier bar_ready[DEPTH]; // track if buffers are ready to be filled,
     __shared__ barrier bar_filled[DEPTH]; // track if buffers are filled-in respectively
 
-    int tid = threadIdx.y*blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    const int thread_in_wg = tid % WG_SIZE;
+    const int wg = tid / WG_SIZE;
+
+    const bool is_consumer = (wg < CONSUMER_WGS);
+    const bool is_producer = (wg >= CONSUMER_WGS) && (wg < CONSUMER_WGS + PRODUCER_WGS);
+
+    static_assert((THREADS_PER_CTA % WG_SIZE) == 0, "CTA must be an integer # of warpgroups");
+    static_assert((CONSUMER_WGS + PRODUCER_WGS) * WG_SIZE == THREADS_PER_CTA,
+              "Role partition must cover the CTA exactly");
+
     if (tid < DEPTH) {
-        init(bar_ready + tid, blockDim.x * blockDim.y);
-        init(bar_filled + tid, blockDim.x * blockDim.y);
+        init(bar_ready + tid, THREADS_PER_CTA);
+        init(bar_filled + tid, THREADS_PER_CTA);
         cde::fence_proxy_async_shared_cta();
     }
     
+    const int NPIX = BLOCK_SIZE * BLOCK_SIZE;
     int oc_offset = BLOCK_DEPTH * blockIdx.z;
     const int g_eff   = max(0, min(BLOCK_DEPTH, OUT_C - oc_offset));
 
     // Zero out smem_out
-    for (int i = tid; i < g_eff*BLOCK_SIZE*BLOCK_SIZE; i += blockDim.x * blockDim.y) {
-        int z = i / (BLOCK_SIZE*BLOCK_SIZE); 
-        int inner = i % (BLOCK_SIZE*BLOCK_SIZE);
+    for (int i = tid; i < g_eff * NPIX; i += THREADS_PER_CTA) {
+        int z = i / (NPIX); 
+        int inner = i % (NPIX);
         int y = inner / BLOCK_SIZE, x = inner % BLOCK_SIZE;
         smem_out[z][y][x] = 0.0f;
     }
     
-    
     // Sync to make barriers, zeroed out accumulator visible to everyone
     __syncthreads();
 
-    // For now: 1 producer warpgroup and 1 consumer warpgroup (16x16 block)
-    // Can increase block size to 16x32 for 3 consumer 1 producer
-    if (tid < warpSize * 4) {
+    if (is_consumer) {
         // consumer
+        // TODO: Add setmaxnreg instruction to increase register count
+
         for (int i = 0; i < DEPTH; ++i) {
             bar_ready[i].arrive(); // buffers are made ready for initial fill
         }
-        // for (int c = 0; c < IN_C; ++c) {
-        //     int buf = c % DEPTH;
-        //     bar_filled[buf].arrive_and_wait();
-        //     float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
-        //     // if (tid == 0) {
-        //     //     printf("Computing on channel %d for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
-        //     //     printf("Printing out section of current buffer %d for block (%d, %d) for reference: %f, %f, %f, %f \n", buf, blockIdx.x, blockIdx.y, cur_buf[0][0], cur_buf[0][1], cur_buf[1][0], cur_buf[1][1]);
-        //     // }
-        //     for (int oc = 0; oc < g_eff; oc += 1) {
-        //         for (int i = tid; i < BLOCK_SIZE*BLOCK_SIZE; i += warpSize * 4) {
-        //             int local_y = i / BLOCK_SIZE;
-        //             int local_x = i % BLOCK_SIZE;
-        //             float accum = 0.0f;
-        //             for (int ky = 0; ky < K; ++ky) {
-        //                 for (int kx = 0; kx < K; ++kx) {
-        //                     int sy = local_y + ky;
-        //                     int sx = local_x + kx;
-        //                     if (sy < SH_TILE_W && sx < SH_TILE_W) {
-        //                         accum += cur_buf[sy][sx] * smem_kernel[buf][oc][ky][kx];
-        //                     }
-        //                 }
-        //             }
-        //             smem_out[oc][local_y][local_x] += accum;
-        //         }
-        //     }
-        //     barrier::arrival_token token = bar_ready[buf].arrive();
-        // }
-
-        const int NPIX = BLOCK_SIZE * BLOCK_SIZE;
-        const int num_consumers = warpSize * 4;
-        constexpr int WARP_SZ = 32; // warpSize
-        constexpr int SLOTS_MAX = (BLOCK_SIZE*BLOCK_SIZE + (WARP_SZ*4) - 1) / (WARP_SZ*4); // how many output pixels each consumer thread calculates, compile time constant
+        
+        constexpr int SLOTS_MAX = (NPIX + (NUM_CONSUMERS) - 1) / (NUM_CONSUMERS); // how many output pixels each consumer thread calculates, compile time constant
         float acc_slots[SLOTS_MAX][BLOCK_DEPTH]; // thus we can alleviate per thread register pressure by reucing work per block (i.e reducing BLOCK_DEPTH). But that also decreases input reuse
         // zero out accumulators-per-thread
         for (int s = 0; s < SLOTS_MAX; ++s) {
@@ -223,17 +213,15 @@ __global__ void producer_consumer_pattern(
         for (int c = 0; c < IN_C; ++c) {
             int buf = c % DEPTH;
             bar_filled[buf].arrive_and_wait();
-            // float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
             float* tile0 = in_tile(smem_in, buf, 0, 0, plane_stride_elems, tile_w_pad);
 
             // process all pixels owned by this thread
-            for (int i = tid, s = 0; i < NPIX; i += num_consumers, ++s) {
+            for (int i = tid, s = 0; i < NPIX; i += NUM_CONSUMERS, ++s) {
                 // calculates top left corner of convolution window
                 int ly = i / BLOCK_SIZE;
                 int lx = i % BLOCK_SIZE;
                 
                 for (int ky = 0; ky < K; ++ky) {
-                    // float* row = &cur_buf[ly + ky][lx]; // stride-less
                     float* row = tile0 + (ly * stride_y + ky) * tile_w_pad + lx * stride_x;
                     for (int kx = 0; kx < K; ++kx) {
                         float x = row[kx]; // load value to register
@@ -246,7 +234,7 @@ __global__ void producer_consumer_pattern(
             barrier::arrival_token token = bar_ready[buf].arrive();
         }
 
-        for (int i = tid, s = 0; i < NPIX; i += num_consumers, ++s) {
+        for (int i = tid, s = 0; i < NPIX; i += NUM_CONSUMERS, ++s) {
             int ly = i / BLOCK_SIZE, lx = i % BLOCK_SIZE;
             for (int oc = 0; oc < g_eff; ++oc) {
                 smem_out[oc][ly][lx] = acc_slots[s][oc];
@@ -255,16 +243,13 @@ __global__ void producer_consumer_pattern(
     }
     else {
         // producer
-        // Give up registers with "setmaxnreg"
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32));
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(32)); // Give up registers with "setmaxnreg"
         for (int c = 0; c < IN_C; ++c) {
-            // Determine which buffer to load into
-            int buf = c % DEPTH;
-            // float (*cur_buf)[TILE_W_PAD] = smem_buf[buf].data;
+            int buf = c % DEPTH; // Determine which buffer to load into
             float* dst = in_tile(smem_in, buf, 0, 0, plane_stride_elems, tile_w_pad);
             bar_ready[buf].arrive_and_wait();
             barrier::arrival_token t_load;
-            if (tid == 128) {
+            if (thread_in_wg == 0) {
                 // printf("reading channel %d from global for block (%d, %d) \n", c, blockIdx.x, blockIdx.y);
                 cde::cp_async_bulk_tensor_3d_global_to_shared(
                     dst,
@@ -278,8 +263,8 @@ __global__ void producer_consumer_pattern(
             }
             else {
                 // load corresponding kernels in 
-                int rel_tid = tid - warpSize*4 - 1; // since thread 128 won't execute this part
-                for (int i = rel_tid; i < g_eff*K*K; i += warpSize*4) {
+                int rel_tid = tid - NUM_PRODUCERS - 1; // since thread 128 won't execute this part
+                for (int i = rel_tid; i < g_eff*K*K; i += (NUM_PRODUCERS - 1)) {
                     // now to determine what it will load and where to. consective threads should load in one whole filter
                     int out_c = i / (K*K);
                     int inner = i % (K*K);
@@ -294,9 +279,8 @@ __global__ void producer_consumer_pattern(
     
     cde::fence_proxy_async_shared_cta();
     __syncthreads();
-    // Final TMA store of smem_out → global
+    // Final TMA store of smem_out to global
     if (tid == 0) {
-        // printf("Committing output tile for block (%d, %d)\n", blockIdx.x, blockIdx.y);
         cde::cp_async_bulk_tensor_3d_shared_to_global(
             &output_map,
             blockIdx.x*BLOCK_SIZE,
@@ -343,7 +327,7 @@ void launch_conv2d_tma_3d(torch::Tensor input, torch::Tensor kernel, torch::Tens
     );
 
     // Kernel launch
-    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);  
+    dim3 threads(THREADS_PER_CTA);  
     dim3 blocks(
         (OUT_W + BLOCK_SIZE - 1) / BLOCK_SIZE, 
         (OUT_H + BLOCK_SIZE - 1) / BLOCK_SIZE, 
