@@ -6,18 +6,18 @@ torch.backends.cudnn.enabled = False    # cuDNN optimizations lead to small erro
 
 # Configuration
 N = 4
-IN_C = 3
-OUT_C = 16
+IN_C = 64
+OUT_C = 64
 H = W = 512
 K = 3
 BLOCK_SIZE = 16
-BLOCK_DEPTH = 8
-sy = 2
-sx = 3
+BLOCK_DEPTH = 16
+sy = 1
+sx = 1
 
 # Create multi-channel input and kernel
 input = torch.arange(N * IN_C * H * W, dtype=torch.float32, device='cuda').reshape(N, IN_C, H, W)
-kernel = torch.ones(OUT_C, IN_C, K, K, dtype=torch.float32, device='cuda')  # Use ones for easy reference
+kernel = torch.randn(OUT_C, IN_C, K, K, dtype=torch.float32, device='cuda')  # Use ones for easy reference
 
 # print(input.shape)
 
@@ -51,7 +51,7 @@ max_error = (cuda_valid - ref_valid).abs().max().item()
 print(f"Max absolute error: {max_error:.6f}")
 
 # Optional debugging
-print("CUDA output:\n", cuda_valid)
-print("Reference output:\n", output_ref)
-print("Difference:\n", cuda_valid - output_ref)
+# print("CUDA output:\n", cuda_valid)
+# print("Reference output:\n", output_ref)
+# print("Difference:\n", cuda_valid - output_ref)
 

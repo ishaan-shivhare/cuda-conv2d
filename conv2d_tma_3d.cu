@@ -11,11 +11,11 @@ namespace cde = cuda::device::experimental;
 
 // --------------------------- Tunables ---------------------------
 constexpr int BLOCK_SIZE  = 16; // logical output tile size per CTA (spatial dimension)
-constexpr int BLOCK_DEPTH = 8; // number of output channels per CTA
-constexpr int DEPTH       = 3; // input ring pipeline depth
+constexpr int BLOCK_DEPTH = 16; // number of output channels per CTA
+constexpr int DEPTH       = 2; // input ring pipeline depth
 constexpr int K           = 3;
-constexpr int IN_C        = 3;
-constexpr int OUT_C       = 16;
+constexpr int IN_C        = 64;
+constexpr int OUT_C       = 64;
 
 // Warpgroup specialization (Hopper): 1 warpgroup = 4 warps = 128 threads
 constexpr int WARP_SZ      = 32;
@@ -23,7 +23,7 @@ constexpr int WARPS_PER_WG = 4;
 constexpr int WG_SIZE      = WARPS_PER_WG * WARP_SZ; // 128
 
 // Choose #consumer & #producer warpgroups (decoupled from BLOCK_SIZE)
-constexpr int CONSUMER_WGS = 1;  // 1 consumer warpgroup (128 threads)
+constexpr int CONSUMER_WGS = 2;  // 1 consumer warpgroup (128 threads)
 constexpr int PRODUCER_WGS = 1;  // 1 producer warpgroup (128 threads)
 
 // Derived
@@ -270,7 +270,7 @@ __global__ void producer_consumer_pattern(
             }
             else {
                 // load corresponding kernels in 
-                int rel_tid = tid - NUM_PRODUCERS - 1; // since thread 128 won't execute this part
+                int rel_tid = tid - NUM_CONSUMERS - 1; // since thread 128 won't execute this part
                 for (int i = rel_tid; i < g_eff*K*K; i += (NUM_PRODUCERS - 1)) {
                     // now to determine what it will load and where to. consective threads should load in one whole filter
                     int out_c = i / (K*K);
