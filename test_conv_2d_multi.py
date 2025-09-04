@@ -55,3 +55,37 @@ print(f"Max absolute error: {max_error:.6f}")
 # print("Reference output:\n", output_ref)
 # print("Difference:\n", cuda_valid - output_ref)
 
+# ---------------- timing: your kernel ----------------
+warmup, iters = 5, 30
+for _ in range(warmup):
+    output.zero_()
+    my_cuda_conv.conv2d_tma_3d(input, kernel, output, sy, sx)
+torch.cuda.synchronize()
+
+start = torch.cuda.Event(True); end = torch.cuda.Event(True)
+start.record()
+for _ in range(iters):
+    output.zero_()
+    my_cuda_conv.conv2d_tma_3d(input, kernel, output, sy, sx)
+end.record()
+torch.cuda.synchronize()
+ms_custom = start.elapsed_time(end) / iters
+print(f"[Custom kernel] {ms_custom:.3f} ms")
+
+# ---------------- timing: cuDNN FP32 ----------------
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.allow_tf32 = False  # keep it FP32
+
+for _ in range(warmup):
+    F.conv2d(input, kernel, stride=(sy, sx))
+torch.cuda.synchronize()
+
+start = torch.cuda.Event(True); end = torch.cuda.Event(True)
+start.record()
+for _ in range(iters):
+    F.conv2d(input, kernel, stride=(sy, sx))
+end.record()
+torch.cuda.synchronize()
+ms_cudnn = start.elapsed_time(end) / iters
+print(f"[cuDNN FP32]    {ms_cudnn:.3f} ms")

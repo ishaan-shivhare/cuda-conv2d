@@ -12,7 +12,7 @@ namespace cde = cuda::device::experimental;
 // --------------------------- Tunables ---------------------------
 constexpr int BLOCK_SIZE  = 16; // logical output tile size per CTA (spatial dimension)
 constexpr int BLOCK_DEPTH = 16; // number of output channels per CTA
-constexpr int DEPTH       = 2; // input ring pipeline depth
+constexpr int DEPTH       = 3; // input ring pipeline depth
 constexpr int K           = 3;
 constexpr int IN_C        = 64;
 constexpr int OUT_C       = 64;
@@ -138,7 +138,6 @@ __device__ __forceinline__ float* in_tile(float* base, int buf, int y, int x,
             + (size_t)x;
     }
 
-__launch_bounds__(THREADS_PER_CTA, 8)
 __global__ void producer_consumer_pattern(
     const __grid_constant__ CUtensorMap input_map,
     const __grid_constant__ CUtensorMap output_map,
@@ -203,7 +202,7 @@ __global__ void producer_consumer_pattern(
     if (is_consumer) {
         // consumer
         // TODO: Add setmaxnreg instruction to increase register count
-
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(40));
         for (int i = 0; i < DEPTH; ++i) {
             bar_ready[i].arrive(); // buffers are made ready for initial fill
         }
@@ -232,6 +231,7 @@ __global__ void producer_consumer_pattern(
                     float* row = tile0 + (ly * stride_y + ky) * tile_w_pad + lx * stride_x;
                     for (int kx = 0; kx < K; ++kx) {
                         float x = row[kx]; // load value to register
+                        #pragma unroll
                         for (int oc = 0; oc < g_eff; ++oc) {
                             acc_slots[s][oc] += x * smem_kernel[buf][oc][ky][kx];
                         }
