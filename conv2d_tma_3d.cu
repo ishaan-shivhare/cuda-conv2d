@@ -14,8 +14,8 @@ constexpr int BLOCK_SIZE  = 16; // logical output tile size per CTA (spatial dim
 constexpr int BLOCK_DEPTH = 16; // number of output channels per CTA
 constexpr int DEPTH       = 3; // input ring pipeline depth
 constexpr int K           = 3;
-constexpr int IN_C        = 64;
-constexpr int OUT_C       = 64;
+constexpr int IN_C        = 32;
+constexpr int OUT_C       = 128;
 
 // Warpgroup specialization (Hopper): 1 warpgroup = 4 warps = 128 threads
 constexpr int WARP_SZ      = 32;
@@ -277,7 +277,7 @@ __global__ void producer_consumer_pattern(
                     int inner = i % (K*K);
                     int row = inner / K;
                     int col = inner % K;
-                    smem_kernel[buf][out_c][row][col] = kernel[(out_c + oc_offset)*IN_C*K*K + c*K*K + row*K + col];
+                    smem_kernel[buf][out_c][row][col] = kernel[(c*OUT_C + (out_c + oc_offset))*K*K + row*K + col];
                 }
                 t_load = bar_filled[buf].arrive();
             }
